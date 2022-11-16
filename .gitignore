@@ -1,0 +1,4 @@
+# Remove local gradle content
+/src/Library/.gradle
+# Remove local build content
+/src/Library/build
