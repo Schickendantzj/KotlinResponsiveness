@@ -39,10 +39,13 @@ kotlin {
     sourceSets {
         val commonMain by getting {
             val ktor_version: String by project
+            val okhttp_version: String by project
             dependencies {
                 implementation("io.ktor:ktor-client-core:$ktor_version")
                 implementation("io.ktor:ktor-client-cio:$ktor_version")
                 implementation("io.ktor:ktor-client-java:$ktor_version")
+                implementation("io.ktor:ktor-client-okhttp:$ktor_version")
+                implementation("com.squareup.okhttp3:okhttp:$okhttp_version")
             }
         }
         val commonTest by getting {
