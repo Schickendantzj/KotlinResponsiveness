@@ -5,11 +5,21 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="a9dabff6-10ce-44b1-86cf-d7e0b5e58cb1" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/src/jvmMain/kotlin/MyOkHttpEngine.kt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../Professional-Biography.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../Project-Description.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../Task-List.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../User-Stories.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../diagrams/Design 0 - Top Level.drawio" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../diagrams/Design 0 - Top Level.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../diagrams/Design 1 - Inter Level.drawio" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../diagrams/Design 1 - Inter Level.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../diagrams/Design 2 - Detailed Level.drawio" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../diagrams/Design 2 - Detailed Level.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../diagrams/Responsiveness Algorithm.drawio" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/../../diagrams/Responsiveness Algorithm.png" beforeDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/build.gradle.kts" beforeDir="false" afterPath="$PROJECT_DIR$/build.gradle.kts" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/gradle.properties" beforeDir="false" afterPath="$PROJECT_DIR$/gradle.properties" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/jvmMain/kotlin/MainFactory.kt" beforeDir="false" afterPath="$PROJECT_DIR$/src/jvmMain/kotlin/MainFactory.kt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/jvmMain/kotlin/MyOkHttpEngine.kt" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />

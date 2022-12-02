@@ -15,6 +15,7 @@ import io.ktor.client.plugins.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.ktor.http.Headers
 import io.ktor.http.cio.Request
 import io.ktor.http.content.*
 import io.ktor.util.*
@@ -33,6 +34,8 @@ import kotlin.coroutines.CoroutineContext
 import kotlin.system.measureNanoTime
 
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Proxy
 import java.security.cert.Certificate
 import java.util.*
 import java.util.concurrent.TimeUnit
@@ -136,7 +139,7 @@ class Context(stop: Boolean) {
 object JvmMain : Main {
 
     //https://gaumala.com/posts/2020-01-27-working-with-streams-kotlin.html
-    class ObservableInputStream(private val chunk: ByteArray, private val onBytesRead: (Long) -> Unit): InputStream() {
+    class ObservableInputStream(private val chunk: ByteArray, private val onBytesRead: (Long) -> Unit) : InputStream() {
         private var bytesRead: Long = 0
 
         @Throws(IOException::class)
@@ -225,8 +228,10 @@ object JvmMain : Main {
         }
     }
 
-    class ObservableOutputStream(private val chunk: ByteArray,
-                                 private val onBytesWritten: (Long) -> Unit): OutputStream() {
+    class ObservableOutputStream(
+        private val chunk: ByteArray,
+        private val onBytesWritten: (Long) -> Unit
+    ) : OutputStream() {
         private var bytesWritten: Long = 0
 
         @Throws(IOException::class)
@@ -263,14 +268,21 @@ object JvmMain : Main {
     }
 
     // Should have a class for the connection holding, Client, URL, Context, Active, ID.
-    suspend fun startDownload(client: io.ktor.client.HttpClient, url: String, context: Context, id: Int, coroutineContext: CoroutineContext) {
+    suspend fun startDownload(
+        client: io.ktor.client.HttpClient,
+        url: String,
+        context: Context,
+        id: Int,
+        coroutineContext: CoroutineContext
+    ) {
         withContext(coroutineContext) {
             launch() {
                 // TODO MAKE THIS A FUNCTION
                 var exitLogging = false
 
                 // Make sure that the object is thread safe
-                var internalBytesRead = AtomicLong(0L) // This is for the body stream returning bytes read on each read call
+                var internalBytesRead =
+                    AtomicLong(0L) // This is for the body stream returning bytes read on each read call
                 var internalBytesReadTotal = AtomicLong(0L)
                 var bytesRead = AtomicLong(0L)
                 var bytesReadTotal = AtomicLong(0L)
@@ -279,7 +291,7 @@ object JvmMain : Main {
 
                 // Coroutine to log throughput every 500ms
                 launch(currentCoroutineContext()) {
-                    while(!exitLogging) {
+                    while (!exitLogging) {
                         delay(500L) // Delay/Pause for 500ms
                         val currentTime = System.nanoTime() - updateTime.get()
                         println("D${id}: Received ${bytesRead.get()} bytes | ${bytesToMegabytes(bytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
@@ -303,16 +315,15 @@ object JvmMain : Main {
                         bytesRead.getAndAdd(_bytesReadTotal - lastBytesReadTotal)
                         lastBytesReadTotal = _bytesReadTotal
                     }
-                    setAttributes {
-                        put(AttributeKey<String>("tag"), "D${id}")
-                    }
+                    header("ID", "D${id}")
                 }.execute { httpResponse: HttpResponse ->
                     val channel: ByteReadChannel = httpResponse.body()
 
                     // To read the packets from the stream channel
                     var elapsedTimeReading = 0L
                     while (!channel.isClosedForRead) {
-                        val packet = channel.readRemaining(DEFAULT_BUFFER_SIZE.toLong()) //  // DEFAULT_BUFFER_SIZE = 8192 as tested
+                        val packet =
+                            channel.readRemaining(DEFAULT_BUFFER_SIZE.toLong()) //  // DEFAULT_BUFFER_SIZE = 8192 as tested
                         while (!packet.isEmpty) {
                             val bytes: ByteArray
                             val timeInNanos = measureNanoTime {
@@ -329,14 +340,21 @@ object JvmMain : Main {
         }
     }
 
-    suspend fun startUpload(client: io.ktor.client.HttpClient, url: String, context: Context, id: Int, coroutineContext: CoroutineContext) {
+    suspend fun startUpload(
+        client: io.ktor.client.HttpClient,
+        url: String,
+        context: Context,
+        id: Int,
+        coroutineContext: CoroutineContext
+    ) {
         withContext(coroutineContext) {
             launch() {
                 // TODO MAKE THIS A FUNCTION
                 var exitLogging = false
 
                 // Make sure that the object is thread safe
-                var internalBytesRead = AtomicLong(0L) // This is for the observable stream returning bytes read on each read call
+                var internalBytesRead =
+                    AtomicLong(0L) // This is for the observable stream returning bytes read on each read call
                 var internalBytesReadTotal = AtomicLong(0L)
                 var bytesRead = AtomicLong(0L)
                 var bytesReadTotal = AtomicLong(0L)
@@ -345,7 +363,7 @@ object JvmMain : Main {
 
                 // Coroutine to log throughput every 500ms
                 launch(currentCoroutineContext()) {
-                    while(!exitLogging) {
+                    while (!exitLogging) {
                         delay(500L) // Delay/Pause for 500ms
                         val currentTime = System.nanoTime() - updateTime.get()
                         println("U${id}: Sent ${bytesRead.get()} bytes | ${bytesToMegabytes(bytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
@@ -377,9 +395,7 @@ object JvmMain : Main {
                         internalBytesRead.getAndAdd(bytes)
                         // println("U${id}: Read ${bytes}")
                     })
-                    setAttributes {
-                        put(AttributeKey<String>("tag"), "U${id}")
-                    }
+                    header("ID", "U${id}")
                 }
             }
         }
@@ -416,59 +432,97 @@ object JvmMain : Main {
         var responseBodyEnd: Long = -1      // Response Body Ended
 
         // Socket connection
-        var socketStart = -1      // Socket command started
-        var socketEnd = -1        // Socket command ended
-        var socketAcquired = -1   // Socket acquired // -2 for failed acquire
+        var socketStart: Long = -1      // Socket command started
+        var socketEnd: Long = -1        // Socket command ended
+        var socketAcquired: Long = -1   // Socket acquired // -2 for failed acquire
     }
 
 
+    // Used to store the information about connection
+    class ConnectionID(val ConnID: Long, val ConnDirection: String) {
+        var RequestID: Long = -1
+    }
 
-    class MyListener(val startTime: Long): EventListener() {
-        // https://square.github.io/okhttp/3.x/okhttp/okhttp3/EventListener.html#EventListener--
-        val connectionStats: MutableMap<String, ConnectionStats> = mutableMapOf<String, ConnectionStats>()
-        override fun callStart(call: Call) {
-            // This will never have the correct tag because it is passed before it gets called
-            val tag = call.request().tag()
-            println("${tag}: Call started/executed/enqueued by a client")
-        }
-
-        override fun callEnd(call: Call) {
-            println("Call finished")
-        }
-
-        override fun callFailed(call: Call, ioe: IOException) {
-            println("Call failed")
-        }
-
-        override fun dnsStart(call: Call, domainName: String) {
-            val tag = call.request().tag()
-            println("${tag}: DNS Search Started: ${currTimeDelta(startTime)} ms | for ${domainName}")
-        }
-
-        override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
-            val tag = call.request().tag()
-            println("${tag}: DNS Search Returned: ${currTimeDelta(startTime)} ms | for ${domainName}")
-        }
-
-        override fun secureConnectStart(call: Call) {
-            val tag = call.request().tag()
-            println("${tag}: TLS connection started: ${currTimeDelta(startTime)} ms")
-        }
-
-        override fun secureConnectEnd(call: Call, handshake: Handshake?) {
-            val tag = call.request().tag()
-            if (handshake != null) {
-                println("${tag}: TLS connection finished: ${currTimeDelta(startTime)} ms | version: ${handshake.tlsVersion}")
+    // FROM: https://square.github.io/okhttp/features/events/
+    // We can use an event listener factory to create a unique event listener for EACH call
+    class ListenerFactory(): EventListener.Factory {
+        companion object {
+            private var ID = AtomicLong(0L)
+            fun getID(): Long {
+                return ID.getAndIncrement().toLong()
             }
         }
 
-        override fun responseBodyStart(call: Call) {
-            val tag = call.request().tag()
-            println("${tag}: ResponseBodyStarted: ${currTimeDelta(startTime)} ms")
+        // Says its an error to mutate Call here DO NOT MUTATE Call.
+        override fun create(call: Call): EventListener {
+            var id = call.request().headers.get("ID")
+            if (id == null) {
+                println("ERROR: NO ID HEADER IN REQUEST")
+                id = ""
+            }
+            return Listener(id, System.nanoTime())
         }
 
+        class Listener(val ID: String, val startTime: Long) : EventListener() {
+            val connectionStats = ConnectionStats(System.nanoTime()) // TODO: consider using the same starTime as passed
 
 
+            // https://square.github.io/okhttp/3.x/okhttp/okhttp3/EventListener.html#EventListener--
+            override fun callStart(call: Call) {
+
+                connectionStats.callStart = System.nanoTime()
+                println("${this.ID}: Call started/executed/enqueued by a client")
+            }
+
+            override fun callEnd(call: Call) {
+                connectionStats.callEnd = System.nanoTime()
+                println("${this.ID}: Call ended")
+            }
+
+            override fun callFailed(call: Call, ioe: IOException) {
+                connectionStats.callEnd = System.nanoTime()
+                println("${this.ID}: Call Failed")
+            }
+
+            override fun dnsStart(call: Call, domainName: String) {
+                connectionStats.dnsStart = System.nanoTime()
+                println("${this.ID}: DNS Search Started: ${currTimeDelta(startTime)} ms | for ${domainName}")
+            }
+
+            override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
+                connectionStats.dnsEnd = System.nanoTime()
+                println("${this.ID}: DNS Search Returned: ${currTimeDelta(startTime)} ms | for ${domainName} | ${inetAddressList}")
+            }
+
+            override fun secureConnectStart(call: Call) {
+                connectionStats.tlsStart = System.nanoTime()
+                println("${this.ID}: TLS connection started: ${currTimeDelta(startTime)} ms")
+            }
+
+            override fun secureConnectEnd(call: Call, handshake: Handshake?) {
+                connectionStats.tlsEnd = System.nanoTime()
+                if (handshake != null) {
+                    println("${this.ID}: TLS connection finished: ${currTimeDelta(startTime)} ms | version: ${handshake.tlsVersion}")
+                } else {
+                    println("${this.ID}: TLS connection failed: ${currTimeDelta(startTime)} ms")
+                }
+            }
+
+            override fun responseBodyStart(call: Call) {
+                connectionStats.responseBodyStart = System.nanoTime()
+                println("${this.ID}: ResponseBodyStarted: ${currTimeDelta(startTime)} ms")
+            }
+
+            override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
+                connectionStats.socketStart = System.nanoTime()
+                println("${this.ID}: connectStart SOCKET START: ${currTimeDelta(startTime)} ms")
+            }
+
+            override fun connectionAcquired(call: Call, connection: Connection) {
+                connectionStats.socketAcquired = System.nanoTime()
+                println("${this.ID}: SOCKET ACQUIRED: ${currTimeDelta(startTime)} ms | Local Port: ${connection.socket().localPort}")
+            }
+        }
     }
 
     // Returns delta timeStart, currentTime(System.nanoTime()) normalized to ms
@@ -500,46 +554,52 @@ object JvmMain : Main {
 //                protocolVersion = java.net.http.HttpClient.Version.HTTP_2
 //            }
 //        }
-
-
         // OKHTTP Client
 
-        val client = io.ktor.client.HttpClient(MyOkHttp) {
-            engine {
-                config {
-                    // TODO FIND A WAY TO FORCE H2
-                    //protocols(listOf<Protocol>(okhttp3.Protocol.HTTP_2, okhttp3.Protocol.H2_PRIOR_KNOWLEDGE))
-                    //protocols(listOf<Protocol>(okhttp3.Protocol.H2_PRIOR_KNOWLEDGE))
-
-                    // Add listener to measure RTT
-                    eventListener(MyListener(System.nanoTime()))
-                    connectTimeout(30, TimeUnit.SECONDS)
-                    readTimeout(30, TimeUnit.SECONDS)
-                    writeTimeout(30, TimeUnit.SECONDS)
-                    var d = Dispatcher()
-                    d.maxRequestsPerHost = 30
-                    dispatcher(d)
-                    // Add interceptor to add a tag to all requests (did not manage to do so with the ktor HTTPclient)
-
-//                    addInterceptor(MyInterceptor())
-//                    addNetworkInterceptor { chain ->
-//                        var request = chain.request()
-//                        val id: String = UUID.randomUUID().toString()
-//                        val builder = request.newBuilder().tag(id)
+//        val client = io.ktor.client.HttpClient(OkHttp) {
+//            engine {
+//                config {
+//                    // TODO FIND A WAY TO FORCE H2
+//                    //protocols(listOf<Protocol>(okhttp3.Protocol.HTTP_2, okhttp3.Protocol.H2_PRIOR_KNOWLEDGE))
+//                    //protocols(listOf<Protocol>(okhttp3.Protocol.H2_PRIOR_KNOWLEDGE))
+//
+//                    // Add listener to measure RTT
+//                    eventListenerFactory(ListenerFactory())
+//                    // connectTimeout(30, TimeUnit.SECONDS)
+//                    // readTimeout(30, TimeUnit.SECONDS)
+//                    // writeTimeout(30, TimeUnit.SECONDS)
+//
+//                    // var d = Dispatcher()
+//                    // d.maxRequestsPerHost = 30
+//                    // dispatcher(d)
+//                    // Add interceptor to add a tag to all requests (did not manage to do so with the ktor HTTPclient)
+//
+////                    addInterceptor(MyInterceptor())
+////                    addNetworkInterceptor { chain ->
+////                        var request = chain.request()
+////                        val id: String = UUID.randomUUID().toString()
+////                        val builder = request.newBuilder().tag(id)
+////                        val out = builder.build()
+////                        chain.proceed(out)
+////                    }
+//                    addInterceptor { chain ->
+//                        val request = chain.request()
+//                        chain.connection()
+//                        val builder = request.newBuilder().removeHeader("ID")
 //                        val out = builder.build()
 //                        chain.proceed(out)
 //                    }
-                }
-            }
-        }
+//                }
+//            }
+//        }
 
-        // Here I am going to intercept the send call to define my own
-        // Using https://github.com/ktorio/ktor/blob/main/ktor-client/ktor-client-okhttp/jvm/src/io/ktor/client/engine/okhttp/OkHttpEngine.kt
-        client.plugin(HttpSend).intercept { request ->
-            println(request.attributes.allKeys)
-
-            execute(request)
-        }
+//        // Here I am going to intercept the send call to define my own
+//        // Using https://github.com/ktorio/ktor/blob/main/ktor-client/ktor-client-okhttp/jvm/src/io/ktor/client/engine/okhttp/OkHttpEngine.kt
+//        client.plugin(HttpSend).intercept { request ->
+//            println(request.headers.get("ID"))
+//
+//            execute(request)
+//        }
 
 
         // DEFAULT CLIENT (NO HTTP2)
@@ -550,9 +610,43 @@ object JvmMain : Main {
         runBlocking {
             // Download Starts
             for (i in 1..4) {
-
                 launch {
-                    Thread.sleep(500)
+                    val client = io.ktor.client.HttpClient(OkHttp) {
+                        engine {
+                            config {
+                                // TODO FIND A WAY TO FORCE H2
+                                //protocols(listOf<Protocol>(okhttp3.Protocol.HTTP_2, okhttp3.Protocol.H2_PRIOR_KNOWLEDGE))
+                                //protocols(listOf<Protocol>(okhttp3.Protocol.H2_PRIOR_KNOWLEDGE))
+                                connectionPool(ConnectionPool())
+                                // Add listener to measure RTT
+                                eventListenerFactory(ListenerFactory())
+                                // connectTimeout(30, TimeUnit.SECONDS)
+                                // readTimeout(30, TimeUnit.SECONDS)
+                                // writeTimeout(30, TimeUnit.SECONDS)
+
+                                var d = Dispatcher()
+                                d.maxRequestsPerHost = 1
+                                dispatcher(d)
+                                // Add interceptor to add a tag to all requests (did not manage to do so with the ktor HTTPclient)
+
+//                    addInterceptor(MyInterceptor())
+//                    addNetworkInterceptor { chain ->
+//                        var request = chain.request()
+//                        val id: String = UUID.randomUUID().toString()
+//                        val builder = request.newBuilder().tag(id)
+//                        val out = builder.build()
+//                        chain.proceed(out)
+//                    }
+                                addInterceptor { chain ->
+                                    val request = chain.request()
+                                    chain.connection()
+                                    val builder = request.newBuilder().removeHeader("ID")
+                                    val out = builder.build()
+                                    chain.proceed(out)
+                                }
+                            }
+                        }
+                    }
                     println("Starting download: D${i}")
                     startDownload(client, URL_TO_GET, context, i, this.coroutineContext)
                 }
@@ -560,6 +654,42 @@ object JvmMain : Main {
             // Upload Starts
             for (i in 1..5) {
                 launch {
+                    val client = io.ktor.client.HttpClient(OkHttp) {
+                        engine {
+                            config {
+                                // TODO FIND A WAY TO FORCE H2
+                                //protocols(listOf<Protocol>(okhttp3.Protocol.HTTP_2, okhttp3.Protocol.H2_PRIOR_KNOWLEDGE))
+                                //protocols(listOf<Protocol>(okhttp3.Protocol.H2_PRIOR_KNOWLEDGE))
+                                connectionPool(ConnectionPool())
+                                // Add listener to measure RTT
+                                eventListenerFactory(ListenerFactory())
+                                // connectTimeout(30, TimeUnit.SECONDS)
+                                // readTimeout(30, TimeUnit.SECONDS)
+                                // writeTimeout(30, TimeUnit.SECONDS)
+
+                                var d = Dispatcher()
+                                d.maxRequestsPerHost = 1
+                                dispatcher(d)
+                                // Add interceptor to add a tag to all requests (did not manage to do so with the ktor HTTPclient)
+
+//                    addInterceptor(MyInterceptor())
+//                    addNetworkInterceptor { chain ->
+//                        var request = chain.request()
+//                        val id: String = UUID.randomUUID().toString()
+//                        val builder = request.newBuilder().tag(id)
+//                        val out = builder.build()
+//                        chain.proceed(out)
+//                    }
+                                addInterceptor { chain ->
+                                    val request = chain.request()
+                                    chain.connection()
+                                    val builder = request.newBuilder().removeHeader("ID")
+                                    val out = builder.build()
+                                    chain.proceed(out)
+                                }
+                            }
+                        }
+                    }
                     println("Starting upload: U${i}")
                     startUpload(client, URL_TO_POST, context, i, this.coroutineContext)
                 }
