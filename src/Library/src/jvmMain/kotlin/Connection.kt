@@ -11,6 +11,7 @@ import io.ktor.http.*
 import io.ktor.utils.io.*
 import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import okhttp3.*
 import java.io.IOException
 import java.net.InetAddress
@@ -23,11 +24,62 @@ import kotlin.coroutines.coroutineContext
 import kotlin.system.measureNanoTime
 import kotlin.text.toByteArray
 
+// UTILS
+fun bytesToMegabytes(bytes: Long): Float {
+    return bytes.toFloat() / 1024 / 1024
+}
+// Utility function for output
+// Nanoseconds to MS
+fun ms(time: Long): Float{
+    return time / 1_000_000f
+}
+
+// TODO rewrite throughput as a request rather than a channel
+
+class ProbeDataPoint (override var value: Float, var connectionID: String,
+                      var probeID: String, var measurementType: String) : DataPoint {
+    // The "value" is the RTT(ms)
+
+    override var ID: String = "${connectionID}:${probeID}"
+
+    override fun toCSV(): String {
+        return "${connectionID}, ${probeID}, ${value}, ${measurementType}\n"
+    }
+
+    override fun getHeaderCSV(): String {
+        return "connectionID, probeID, rtt(ms), measurementType\n"
+    }
+}
+
+// instant should be instant bytes read, time should be in ms
+class ThroughputDataPoint (var instant: Long, var connectionID: String, val time: Float) : DataPoint {
+    // The "value" is the Bytes
+    override var value = bytesToMegabytes(instant) / (time / 1000)
+
+    override var ID: String = connectionID
+
+    override fun toCSV(): String {
+        return "${connectionID}, ${value}\n"
+    }
+
+    override fun getHeaderCSV(): String {
+        return "connectionID, throughput(MB/s)\n"
+    }
+}
+
+class ThroughputHookDataPoint(val block: () -> DataPoint): HookDataPoint {
+    override fun getValue(): DataPoint {
+        return block()
+    }
+
+}
+
+
 // TODO Should this be an interface?
-abstract class Connection {
-    public val id: Int = Connection.getID()
+abstract class Connection(latencyChannel: Channel<DataPoint>, val connectionID: String) {
+    // public val id: Int = Connection.getID() // TODO("Should this be used? We pass the connectionID, do we have any need for forcing uniqueness this way")
     public var probes: ArrayList<Probe> = ArrayList<Probe>()
-    public val listenerFactory: ListenerFactory = ListenerFactory()
+    public val listenerFactory: ListenerFactory = ListenerFactory(latencyChannel, connectionID)
 
     protected val client: HttpClient
     protected var isLoaded: Boolean = false
@@ -45,14 +97,15 @@ abstract class Connection {
         client = io.ktor.client.HttpClient(OkHttp) {
             engine {
                 config {
-                    // TODO FIND A WAY TO FORCE H2
+                    // TODO('FIND A WAY TO FORCE H2; Is this even necessary? 1/26 According to latest no it should be decided
+                    // by "http" or "https"')
                     //protocols(listOf<Protocol>(okhttp3.Protocol.HTTP_2, okhttp3.Protocol.H2_PRIOR_KNOWLEDGE))
                     //protocols(listOf<Protocol>(okhttp3.Protocol.H2_PRIOR_KNOWLEDGE)) // Clear Text
 
                     // Create a new connection pool to make sure we don't reuse the old ones
                     // Force max connections to be 1
-                    // TODO Test that it is only 1 connection
-                    connectionPool(ConnectionPool(2, 5, TimeUnit.MINUTES))
+                    // TODO Test that it is only 1 connection; Seems so
+                    connectionPool(ConnectionPool(1, 2, TimeUnit.SECONDS))
 
                     // Add listener to measure RTT
                     eventListenerFactory(listenerFactory)
@@ -64,6 +117,7 @@ abstract class Connection {
 
                     // Change the Dispatcher to make sure we only ever use one connection
                     var d = Dispatcher()
+                    // TODO we may need more because we may have more than 10 simultaneous probes on one connection (bad delay/dropped packet)
                     d.maxRequestsPerHost = 10
                     dispatcher(d)
 
@@ -89,19 +143,19 @@ abstract class Connection {
         }
     }
 
-    // Load the connection (can only be called once)
+    // Load the connection (SHOULD only be called once)
     abstract suspend fun loadConnection(): Boolean
 
     // Probe the connection
     fun startProbes(url: String, waitTime: Long = 100, timeUnit: TimeUnit = TimeUnit.MILLISECONDS) {
-        println("PROBES STARTED")
+        println("${connectionID}: PROBES STARTED")
         runBlocking {
             launch() {
                 while (true) {
                     // TODO Utilize eventListener Factory
                     val probe = Probe(url, System.nanoTime())
                     client.get(probe.url) {
-                        header("ID", "P${probe.id} : Connection${id}")
+                        header("ID", "P${probe.id}")
                     }
                     delay(timeUnit.toMillis(waitTime))
                 }
@@ -110,7 +164,7 @@ abstract class Connection {
     }
 }
 
-class DownloadConnection(private val url: String) : Connection() {
+class DownloadConnection(private val url: String, latencyChannel: Channel<DataPoint>, val throughputChannel: Channel<HookDataPoint>, connectionID: String) : Connection(latencyChannel, connectionID) {
     override suspend fun loadConnection(): Boolean {
         // Can only call this once and return true
         if (isLoaded) {
@@ -119,7 +173,7 @@ class DownloadConnection(private val url: String) : Connection() {
         isLoaded = true
         // TODO Confirm Async?
         with(CoroutineScope(coroutineContext)) {
-            launch(newSingleThreadContext("D${id}")) {
+            launch(newSingleThreadContext("loadConnection:${connectionID}")) {
                 // TODO MAKE THIS A FUNCTION
                 var exitLogging = false
 
@@ -132,25 +186,41 @@ class DownloadConnection(private val url: String) : Connection() {
                 var startTime = AtomicLong(System.nanoTime())
                 var updateTime = AtomicLong(System.nanoTime())
 
+                throughputChannel.send(ThroughputHookDataPoint {
+                    val currentTime = System.nanoTime() - updateTime.getAndSet(System.nanoTime())
+                    val localByteRead = bytesRead.get()
+                    // Update Values
+                    bytesReadTotal.getAndAdd(bytesRead.get())
+                    bytesRead.set(0)
+
+                    // Update Values for internal
+                    internalBytesReadTotal.getAndAdd(bytesRead.get())
+                    internalBytesRead.set(0)
+
+
+                    ThroughputDataPoint(localByteRead, connectionID, (currentTime / 1_000_000).toFloat())
+                })
                 // Coroutine to log throughput every 500ms
-                launch(currentCoroutineContext()) {
-                    while (!exitLogging) {
-                        delay(500L) // Delay/Pause for 500ms
-                        val currentTime = System.nanoTime() - updateTime.get()
-                        println("D${id}: Received ${bytesRead.get()} bytes | ${bytesToMegabytes(bytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
-                        println("D${id}: Read ${internalBytesRead.get()} bytes | ${bytesToMegabytes(internalBytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
-
-                        // Update Values
-                        bytesReadTotal.getAndAdd(bytesRead.get())
-                        bytesRead.set(0)
-
-                        // Update Values for internal
-                        internalBytesReadTotal.getAndAdd(bytesRead.get())
-                        internalBytesRead.set(0)
-
-                        updateTime.set(System.nanoTime())
-                    }
-                }
+//                launch(currentCoroutineContext()) {
+//                    while (!exitLogging) {
+//                        delay(1000L) // Delay/Pause for 1000ms
+//                        val currentTime = System.nanoTime() - updateTime.get()
+//                        // These help to determine if the Bytes read from the body are the close to
+//                        // those reported from the onDownload callback.
+//                        // println("D${connectionID}: Received ${bytesRead.get()} bytes | ${bytesToMegabytes(bytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
+//                        // println("D${connectionID}: Read ${internalBytesRead.get()} bytes | ${bytesToMegabytes(internalBytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
+//
+//                        // Update Values
+//                        bytesReadTotal.getAndAdd(bytesRead.get())
+//                        bytesRead.set(0)
+//
+//                        // Update Values for internal
+//                        internalBytesReadTotal.getAndAdd(bytesRead.get())
+//                        internalBytesRead.set(0)
+//
+//                        updateTime.set(System.nanoTime())
+//                    }
+//                }
 
                 var lastBytesReadTotal = 0L
                 client.prepareGet(url) {
@@ -158,7 +228,7 @@ class DownloadConnection(private val url: String) : Connection() {
                         bytesRead.getAndAdd(_bytesReadTotal - lastBytesReadTotal)
                         lastBytesReadTotal = _bytesReadTotal
                     }
-                    header("ID", "D${id}")
+                    header("ID", connectionID)
                 }.execute { httpResponse: HttpResponse ->
                     val channel: ByteReadChannel = httpResponse.body()
 
@@ -185,7 +255,7 @@ class DownloadConnection(private val url: String) : Connection() {
     }
 }
 
-class UploadConnection(private val url: String) : Connection() {
+class UploadConnection(private val url: String, latencyChannel: Channel<DataPoint>, val throughputChannel: Channel<HookDataPoint>, connectionID: String) : Connection(latencyChannel, connectionID) {
 
     override suspend fun loadConnection(): Boolean {
         // Can only call this once and return true
@@ -193,9 +263,10 @@ class UploadConnection(private val url: String) : Connection() {
             return false
         }
         isLoaded = true
+
         // TODO Confirm Async?
         with(CoroutineScope(coroutineContext)) {
-            launch(newSingleThreadContext("U${id}")) {
+            launch(newSingleThreadContext("loadConnection:${connectionID}")) {
                 // TODO MAKE THIS A FUNCTION
                 var exitLogging = false
 
@@ -203,31 +274,49 @@ class UploadConnection(private val url: String) : Connection() {
                 var internalBytesRead =
                     AtomicLong(0L) // This is for the observable stream returning bytes read on each read call
                 var internalBytesReadTotal = AtomicLong(0L)
+
                 var bytesRead = AtomicLong(0L)
                 var bytesReadTotal = AtomicLong(0L)
                 var startTime = AtomicLong(System.nanoTime())
                 var updateTime = AtomicLong(System.nanoTime())
 
+                throughputChannel.send(ThroughputHookDataPoint {
+                    val currentTime = System.nanoTime() - updateTime.getAndSet(System.nanoTime())
+                    val localByteRead = bytesRead.get()
+                    // Update Values
+                    bytesReadTotal.getAndAdd(bytesRead.get())
+                    bytesRead.set(0)
+
+                    // Update Values for internal
+                    internalBytesReadTotal.getAndAdd(bytesRead.get())
+                    internalBytesRead.set(0)
+
+
+                    ThroughputDataPoint(localByteRead, connectionID, (currentTime / 1_000_000).toFloat())
+                })
+
                 // Coroutine to log throughput every 500ms
-                launch(currentCoroutineContext()) {
-                    while (!exitLogging) {
-                        delay(500L) // Delay/Pause for 500ms
-                        val currentTime = System.nanoTime() - updateTime.get()
-                        println("U${id}: Sent ${bytesRead.get()} bytes | ${bytesToMegabytes(bytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
-                        println("U${id}: Read ${internalBytesRead.get()} bytes | ${bytesToMegabytes(internalBytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
-
-                        // Update Values
-                        bytesReadTotal.getAndAdd(bytesRead.get())
-                        bytesRead.set(0)
-
-                        // Update Values for internal
-                        internalBytesReadTotal.getAndAdd(bytesRead.get())
-                        internalBytesRead.set(0)
-
-                        // Reset timer
-                        updateTime.set(System.nanoTime())
-                    }
-                }
+//                launch(currentCoroutineContext()) {
+//                    while (!exitLogging) {
+//                        delay(1000L) // Delay/Pause for 1000ms
+//                        val currentTime = System.nanoTime() - updateTime.get()
+//                        // These help to determine if the Bytes read from the InputStream in the body are the close to
+//                        // those reported from the onUpload callback.
+//                        // println("U${id}: Sent ${bytesRead.get()} bytes | ${bytesToMegabytes(bytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
+//                        // println("U${id}: Read ${internalBytesRead.get()} bytes | ${bytesToMegabytes(internalBytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
+//
+//                        // Update Values
+//                        bytesReadTotal.getAndAdd(bytesRead.get())
+//                        bytesRead.set(0)
+//
+//                        // Update Values for internal
+//                        internalBytesReadTotal.getAndAdd(bytesRead.get())
+//                        internalBytesRead.set(0)
+//
+//                        // Reset timer
+//                        updateTime.set(System.nanoTime())
+//                    }
+//                }
 
                 var bytesSentTotalLast = 0L
                 client.post(url) {
@@ -242,7 +331,7 @@ class UploadConnection(private val url: String) : Connection() {
                         internalBytesRead.getAndAdd(bytes)
                         // println("U${id}: Read ${bytes}")
                     })
-                    header("ID", "U${id}")
+                    header("ID", connectionID)
                 }
             }
         }
@@ -301,23 +390,23 @@ class ConnectionStats(val startTime: Long) {
 
 // FROM: https://square.github.io/okhttp/features/events/
 // We can use an event listener factory to create a unique event listener for EACH call
-class ListenerFactory(): EventListener.Factory {
+class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String): EventListener.Factory {
     var loadListener: Listener? = null
     var probeListeners = HashMap<String, Listener>()
 
     // Says it is an error to mutate Call here. DO NOT MUTATE Call.
     override fun create(call: Call): EventListener {
-        var id = call.request().headers.get("ID")
-        if (id == null) {
+        var callID = call.request().headers.get("ID")
+        if (callID == null) {
             println("ERROR: NO ID HEADER IN REQUEST")
-            id = ""
+            callID = ""
         }
-        val listener = Listener(id, System.nanoTime())
-        if (id.startsWith("P")) {
-            if (probeListeners.containsKey(id)) {
+        val listener = Listener(callID, connectionID, System.nanoTime(), channel)
+        if (callID.startsWith("P")) {
+            if (probeListeners.containsKey(callID)) {
                 println("CRITICAL ERROR: PROBE ID IS NOT UNIQUE")
             } else {
-                probeListeners[id] = listener
+                probeListeners[callID] = listener
             }
         } else {
             loadListener = listener
@@ -325,71 +414,74 @@ class ListenerFactory(): EventListener.Factory {
         return listener
     }
 
-    class Listener(val ID: String, val startTime: Long) : EventListener() {
+    class Listener(val callID: String, val connectionID: String, val startTime: Long, val latencyChannel: Channel<DataPoint>) : EventListener() {
         val connectionStats = ConnectionStats(startTime) // TODO: consider using the same startTime as passed vs System nanotime
         // https://square.github.io/okhttp/3.x/okhttp/okhttp3/EventListener.html#EventListener--
 
         // OKHttp3 Call events
         override fun callStart(call: Call) {
             connectionStats.callStart = System.nanoTime()
-            println("${this.ID}: Call started/executed/enqueued by a client")
+            // println("${this.ID}: Call started/executed/enqueued by a client")
         }
 
         override fun callEnd(call: Call) {
             connectionStats.callEnd = System.nanoTime()
-            println("${this.ID}: Call ended")
+            // println("${this.ID}: Call ended")
         }
 
         override fun callFailed(call: Call, ioe: IOException) {
             connectionStats.callEnd = System.nanoTime()
-            println("${this.ID}: Call Failed")
+            println("${this.callID}:${this.connectionID}: Call Failed")
         }
 
         // DNS events
         override fun dnsStart(call: Call, domainName: String) {
             connectionStats.dnsStart = System.nanoTime()
-            println("${this.ID}: DNS Search Started: ${JvmMain.currTimeDelta(startTime)} ms | for ${domainName}")
+            // println("${this.ID}: DNS Search Started: ${JvmMain.currTimeDelta(startTime)} ms | for ${domainName}")
         }
 
         override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
             connectionStats.dnsEnd = System.nanoTime()
-            println("${this.ID}: DNS Search Returned: ${JvmMain.currTimeDelta(startTime)} ms | for ${domainName} | ${inetAddressList}")
+            // println("${this.ID}: DNS Search Returned: ${JvmMain.currTimeDelta(startTime)} ms | for ${domainName} | ${inetAddressList}")
+            println("${this.callID}:${this.connectionID}: DNS search took: ${ms(connectionStats.dnsEnd - connectionStats.dnsStart)} ms")
         }
 
         // TLS events
         override fun secureConnectStart(call: Call) {
             connectionStats.tlsStart = System.nanoTime()
-            println("${this.ID}: TLS connection started: ${JvmMain.currTimeDelta(startTime)} ms")
+            // println("${this.ID}: TLS connection started: ${JvmMain.currTimeDelta(startTime)} ms")
         }
 
         override fun secureConnectEnd(call: Call, handshake: Handshake?) {
             connectionStats.tlsEnd = System.nanoTime()
             if (handshake != null) {
-                println("${this.ID}: TLS connection finished: ${JvmMain.currTimeDelta(startTime)} ms | version: ${handshake.tlsVersion}")
+                // println("${this.ID}: TLS connection finished: ${JvmMain.currTimeDelta(startTime)} ms | version: ${handshake.tlsVersion}")
+                println("${this.callID}:${this.connectionID}: TLS connection took: ${ms(connectionStats.tlsEnd - connectionStats.tlsStart)} ms | version: ${handshake.tlsVersion}")
             } else {
-                println("${this.ID}: TLS connection failed: ${JvmMain.currTimeDelta(startTime)} ms")
+                // println("${this.ID}: TLS connection failed: ${JvmMain.currTimeDelta(startTime)} ms")
+                println("${this.callID}:${this.connectionID}: TLS connection FAILED! took: ${ms(connectionStats.tlsEnd - connectionStats.tlsStart)} ms")
             }
         }
 
         // Request events
         override fun requestHeadersStart(call: Call) {
             connectionStats.requestHeaderStart = System.nanoTime()
-            println("${this.ID}: RequestHeaderStarted: ${JvmMain.currTimeDelta(startTime)} ms")
+            // println("${this.ID}: RequestHeaderStarted: ${JvmMain.currTimeDelta(startTime)} ms")
         }
 
         override fun requestHeadersEnd(call: Call, request: Request) {
             connectionStats.requestHeaderEnd = System.nanoTime()
-            println("${this.ID}: RequestHeaderEnded: ${JvmMain.currTimeDelta(startTime)} ms")
+            // println("${this.ID}: RequestHeaderEnded: ${JvmMain.currTimeDelta(startTime)} ms")
         }
 
         override fun requestBodyStart(call: Call) {
             connectionStats.requestBodyStart = System.nanoTime()
-            println("${this.ID}: RequestBodyStarted: ${JvmMain.currTimeDelta(startTime)} ms")
+            // println("${this.ID}: RequestBodyStarted: ${JvmMain.currTimeDelta(startTime)} ms")
         }
 
         override fun requestBodyEnd(call: Call, byteCount: Long) {
             connectionStats.requestBodyEnd = System.nanoTime()
-            println("${this.ID}: RequestBodyEnded: ${JvmMain.currTimeDelta(startTime)} ms")
+            // println("${this.ID}: RequestBodyEnded: ${JvmMain.currTimeDelta(startTime)} ms")
         }
 
         // requestFailed
@@ -397,31 +489,46 @@ class ListenerFactory(): EventListener.Factory {
         // Response events
         override fun responseHeadersStart(call: Call) {
             connectionStats.responseHeaderStart = System.nanoTime()
-            println("${this.ID}: ResponseHeaderStarted: ${JvmMain.currTimeDelta(startTime)} ms")
-        }
+            // println("${this.ID}: ResponseHeaderStarted: ${JvmMain.currTimeDelta(startTime)} ms")
+
+            // println("${this.callID}:${this.connectionID}: HTTP (request header start - response header start) took: ${ms(connectionStats.responseHeaderStart - connectionStats.requestHeaderStart)} ms")
+            if (this.callID.startsWith("P")) {
+                    val myself = this
+                    GlobalScope.launch {
+                        latencyChannel.send(
+                            ProbeDataPoint(
+                                ms(connectionStats.responseHeaderStart - connectionStats.requestHeaderStart),
+                                myself.connectionID,
+                                myself.callID,
+                                "HTTP"
+                            )
+                        )
+                    }
+                }
+    }
 
         override fun responseBodyStart(call: Call) {
             connectionStats.responseBodyStart = System.nanoTime()
-            println("${this.ID}: ResponseBodyStarted: ${JvmMain.currTimeDelta(startTime)} ms")
+            // println("${this.ID}: ResponseBodyStarted: ${JvmMain.currTimeDelta(startTime)} ms")
         }
 
 
         // Socket events
         override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
             connectionStats.socketStart = System.nanoTime()
-            println("${this.ID}: connectStart SOCKET START ATTEMPT: ${JvmMain.currTimeDelta(startTime)} ms")
+            println("${this.callID}:${this.connectionID}: connectStart SOCKET START ATTEMPT: ${JvmMain.currTimeDelta(startTime)} ms")
         }
 
         override fun connectEnd(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?) {
-            println("${this.ID}: connectEnd SOCKET STARTED: ${JvmMain.currTimeDelta(startTime)} ms | protocol: ${protocol}")
+            println("${this.callID}:${this.connectionID}: connectEnd SOCKET STARTED: ${JvmMain.currTimeDelta(startTime)} ms | protocol: ${protocol}")
         }
 
         override fun connectionAcquired(call: Call, connection: okhttp3.Connection) {
+            // Use this connection and the load connection to make sure they match
+            // Confirm the load connection is a h2
+            // Record the tls version to calculate the # of round trips it contains
             connectionStats.socketAcquired = System.nanoTime()
-            println("${this.ID}: SOCKET ACQUIRED: ${JvmMain.currTimeDelta(startTime)} ms | Local Port: ${connection.socket().localPort}")
+            // println("${this.ID}: SOCKET ACQUIRED: ${JvmMain.currTimeDelta(startTime)} ms | Local Port: ${connection.socket().localPort}")
         }
-
-
-
     }
 }

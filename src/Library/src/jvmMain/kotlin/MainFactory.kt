@@ -24,6 +24,7 @@ import io.ktor.utils.io.* // ByteReadChannel
 import io.ktor.utils.io.core.*
 import io.ktor.utils.io.errors.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
 import okhttp3.*
 import okhttp3.EventListener
 import java.io.InputStream
@@ -40,6 +41,7 @@ import java.security.cert.Certificate
 import java.util.*
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import javax.xml.crypto.Data
 import kotlin.collections.ArrayList
 import kotlin.properties.Delegates
 
@@ -51,6 +53,10 @@ val URL_TO_GET =  "https://mensura.cdn-apple.com/api/v1/gm/large" // "https://rp
 val URL_TO_POST =  "https://mensura.cdn-apple.com/api/v1/gm/slurp" //"https://rpm.obs.cr:443/slurp" //
 val URL_TO_PROBE = "https://mensura.cdn-apple.com/api/v1/gm/small" //
 
+val INITIAL_CONNECTION_COUNT = 4  // Initial Amount of Load Generating Connections (for upload and download)
+val CONNECTION_INCREASE_COUNT = 1 // Amount to increase per cycle (second usually) of the algorithm
+
+
 // GLOBAL USED
 var SEND = ""
 
@@ -59,85 +65,6 @@ actual object MainFactory {
     actual fun createMain(): Main = JvmMain
 }
 
-// UTILS
-fun bytesToMegabytes(bytes: Long): Float {
-    return bytes.toFloat() / 1024 / 1024
-}
-
-
-
-// Class meant to be used to stop all launched coroutines across the board "safely"
-class Context(stop: Boolean) {
-    private class Stopper (
-        var name: String,
-        var reason: String="Context Stopper named: ${name}, has no reason provided",
-        var stop :Boolean=false
-    ) {
-        // Equals when name and reason are the same.
-        override fun equals(other: Any?): Boolean {
-            return (other is Stopper) && other.name == this.name && other.reason == this.name
-        }
-    }
-
-    // TODO: Consider using an array instead
-    private var stoppers:ArrayList<Stopper> = ArrayList<Stopper>()
-
-    // Returns false if the stopper already exists; true on add
-    fun registerStopper(name: String, reason: String=""): Boolean {
-        val stopper: Stopper
-        if (reason != "") {
-            stopper = Stopper(name, reason)
-        } else {
-            stopper = Stopper(name)
-        }
-
-        if (stopper in stoppers) { return false } // Do not add if exists
-        stoppers.add(stopper)
-
-        return true
-
-    }
-
-    // If stopper exists returns true and triggers stopper (starts stops); false if stopper does not exist
-    fun activateStopper(name: String, reason: String=""): Boolean {
-        val stopper: Stopper
-        if (reason != "") {
-            stopper = Stopper(name, reason)
-        } else {
-            stopper = Stopper(name)
-        }
-
-        for (i in this.stoppers) {
-            if (i == stopper) {
-                i.stop = true
-                return true
-            }
-        }
-        return false
-    }
-
-    // Returns true if any stoppers are true
-    fun stop(): Boolean {
-        for (stopper in this.stoppers) {
-            if (stopper.stop) {
-                return true
-            }
-        }
-        return false
-    }
-
-    // Returns a string of the reason why we are stopping
-    fun reason(): String {
-        // TODO MAKE THIS PRETTY
-        var out = ""
-        for (stopper in this.stoppers) {
-            if (stopper.stop) {
-                out += "\n" + stopper.reason
-            }
-        }
-        return out
-    }
-}
 
 object JvmMain : Main {
 
@@ -208,7 +135,7 @@ object JvmMain : Main {
             // Stop Available to lower to keep the buffer from filling on the client side
             // Give it a smaller number like 600
             println("Available got called")
-            return 600
+            return 4096 // 4KB
         }
 
 
@@ -260,7 +187,7 @@ object JvmMain : Main {
         }
 
         @Throws(IOException::class)
-        override fun flush() {
+         override fun flush() {
             //wrapped.flush()
         }
 
@@ -270,153 +197,13 @@ object JvmMain : Main {
         }
     }
 
-    // Should have a class for the connection holding, Client, URL, Context, Active, ID.
-    suspend fun startDownload(
-        client: io.ktor.client.HttpClient,
-        url: String,
-        context: Context,
-        id: Int,
-        coroutineContext: CoroutineContext
-    ) {
-        withContext(coroutineContext) {
-            launch() {
-                // TODO MAKE THIS A FUNCTION
-                var exitLogging = false
-
-                // Make sure that the object is thread safe
-                var internalBytesRead =
-                    AtomicLong(0L) // This is for the body stream returning bytes read on each read call
-                var internalBytesReadTotal = AtomicLong(0L)
-                var bytesRead = AtomicLong(0L)
-                var bytesReadTotal = AtomicLong(0L)
-                var startTime = AtomicLong(System.nanoTime())
-                var updateTime = AtomicLong(System.nanoTime())
-
-                // Coroutine to log throughput every 500ms
-                launch(currentCoroutineContext()) {
-                    while (!exitLogging) {
-                        delay(500L) // Delay/Pause for 500ms
-                        val currentTime = System.nanoTime() - updateTime.get()
-                        println("D${id}: Received ${bytesRead.get()} bytes | ${bytesToMegabytes(bytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
-                        println("D${id}: Read ${internalBytesRead.get()} bytes | ${bytesToMegabytes(internalBytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
-
-                        // Update Values
-                        bytesReadTotal.getAndAdd(bytesRead.get())
-                        bytesRead.set(0)
-
-                        // Update Values for internal
-                        internalBytesReadTotal.getAndAdd(bytesRead.get())
-                        internalBytesRead.set(0)
-
-                        updateTime.set(System.nanoTime())
-                    }
-                }
-
-                var lastBytesReadTotal = 0L
-                client.prepareGet(url) {
-                    onDownload { _bytesReadTotal, contentLength ->
-                        bytesRead.getAndAdd(_bytesReadTotal - lastBytesReadTotal)
-                        lastBytesReadTotal = _bytesReadTotal
-                    }
-                    header("ID", "D${id}")
-                }.execute { httpResponse: HttpResponse ->
-                    val channel: ByteReadChannel = httpResponse.body()
-
-                    // To read the packets from the stream channel
-                    var elapsedTimeReading = 0L
-                    while (!channel.isClosedForRead) {
-                        val packet =
-                            channel.readRemaining(DEFAULT_BUFFER_SIZE.toLong()) //  // DEFAULT_BUFFER_SIZE = 8192 as tested
-                        while (!packet.isEmpty) {
-                            val bytes: ByteArray
-                            val timeInNanos = measureNanoTime {
-                                bytes = packet.readBytes()
-                            }
-                            elapsedTimeReading += timeInNanos
-                            internalBytesRead.getAndAdd(bytes.size.toLong())
-                            //println("Read ${bytes.size} bytes from ${httpResponse.contentLength()} in ${timeInNanos} ns")
-                        }
-                    }
-                    println("Success!")
-                }
-            }
-        }
-    }
-
-    suspend fun startUpload(
-        client: io.ktor.client.HttpClient,
-        url: String,
-        context: Context,
-        id: Int,
-        coroutineContext: CoroutineContext
-    ) {
-        withContext(coroutineContext) {
-            launch() {
-                // TODO MAKE THIS A FUNCTION
-                var exitLogging = false
-
-                // Make sure that the object is thread safe
-                var internalBytesRead =
-                    AtomicLong(0L) // This is for the observable stream returning bytes read on each read call
-                var internalBytesReadTotal = AtomicLong(0L)
-                var bytesRead = AtomicLong(0L)
-                var bytesReadTotal = AtomicLong(0L)
-                var startTime = AtomicLong(System.nanoTime())
-                var updateTime = AtomicLong(System.nanoTime())
-
-                // Coroutine to log throughput every 500ms
-                launch(currentCoroutineContext()) {
-                    while (!exitLogging) {
-                        delay(500L) // Delay/Pause for 500ms
-                        val currentTime = System.nanoTime() - updateTime.get()
-                        println("U${id}: Sent ${bytesRead.get()} bytes | ${bytesToMegabytes(bytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
-                        println("U${id}: Read ${internalBytesRead.get()} bytes | ${bytesToMegabytes(internalBytesRead.get())} megabytes in ${currentTime} ns | ${currentTime / 1_000_000} ms")
-
-                        // Update Values
-                        bytesReadTotal.getAndAdd(bytesRead.get())
-                        bytesRead.set(0)
-
-                        // Update Values for internal
-                        internalBytesReadTotal.getAndAdd(bytesRead.get())
-                        internalBytesRead.set(0)
-
-                        // Reset timer
-                        updateTime.set(System.nanoTime())
-                    }
-                }
-
-                var bytesSentTotalLast = 0L
-                client.post(url) {
-                    onUpload { bytesSentTotal, contentLength ->
-                        //println("U${id}: Sent ${bytesSentTotal}")
-
-                        bytesRead.getAndAdd(bytesSentTotal - bytesSentTotalLast)
-                        bytesSentTotalLast = bytesSentTotal
-                    }
-                    contentType(ContentType.Application.OctetStream)
-                    setBody(JvmMain.ObservableInputStream(SEND.toByteArray()) { bytes ->
-                        internalBytesRead.getAndAdd(bytes)
-                        // println("U${id}: Read ${bytes}")
-                    })
-                    header("ID", "U${id}")
-                }
-            }
-        }
-    }
-
-
-
-
-    // Used to store the information about connection
-    class ConnectionID(val ConnID: Long, val ConnDirection: String) {
-        var RequestID: Long = -1
-    }
-
-
-
     // Returns delta timeStart, currentTime(System.nanoTime()) normalized to ms
     fun currTimeDelta(startTime: Long): Double {
         return ((System.nanoTime() - startTime) / 1_000_000.0)
+    }
+
+    fun API() {
+
     }
 
     override fun main(args: Array<String>): Unit {
@@ -448,26 +235,98 @@ object JvmMain : Main {
 //        val client = io.ktor.client.HttpClient(CIO)
 
 
-        var context = Context(false)
+        var context = StopperContext(false)
+
+        // Latency Channels & Stability
+        var uploadLatencyChannel= Channel<DataPoint>()
+        var uploadLatencyStability = LatencyStability("Upload", uploadLatencyChannel, 5, 10f)
+        var downloadLatencyChannel = Channel<DataPoint>()
+        var downloadLatencyStability = LatencyStability("Download", downloadLatencyChannel, 5, 10f)
+
+        // Throughput Channels & Stability
+        var uploadThroughputChannel = Channel<HookDataPoint>()
+        var uploadThroughputStability = ThroughputStability("Upload", uploadThroughputChannel, 5, 10f)
+        var downloadThroughputChannel = Channel<HookDataPoint>()
+        var downloadThroughputStability = ThroughputStability("Download", downloadThroughputChannel, 5, 10f)
+
+        var numUploadConnections = 0
+        var numDownloadConnections = 0
         runBlocking {
+            // Start internal receiving
+            launch {uploadLatencyStability.start()}
+            launch {downloadLatencyStability.start()}
+            launch {uploadThroughputStability.start()}
+            launch {downloadThroughputStability.start()}
+
+
             // Download Starts
-            for (i in 1..4) {
-                launch(newSingleThreadContext("D:${i}")) {
-                    val connection = org.responsiveness.main.DownloadConnection(URL_TO_GET)
+            for (i in 1..INITIAL_CONNECTION_COUNT) {
+                numDownloadConnections += 1
+                launch(newSingleThreadContext("D:${numDownloadConnections}")) {
+                    val connection = org.responsiveness.main.DownloadConnection(URL_TO_GET, downloadLatencyChannel, downloadThroughputChannel, "D${numDownloadConnections}")
                     connection.loadConnection()
                     delay(1000)
                     connection.startProbes(URL_TO_PROBE)
                 }
             }
             // Upload Starts
-            for (i in 1..5) {
-                launch(newSingleThreadContext("U:${i}")) {
-                    val connection = org.responsiveness.main.UploadConnection(URL_TO_POST)
+            for (i in 1..INITIAL_CONNECTION_COUNT) {
+                numUploadConnections += 1
+                launch(newSingleThreadContext("U:${numUploadConnections}")) {
+                    val connection = org.responsiveness.main.UploadConnection(URL_TO_POST, uploadLatencyChannel, uploadThroughputChannel, "U${numUploadConnections}")
                     connection.loadConnection()
                     delay(1000)
                     connection.startProbes(URL_TO_PROBE)
                 }
             }
+
+            // Main responsiveness test loop
+            launch {
+                var testStartTime = System.nanoTime()
+                var uploadLatencyStable = false
+                var downloadLatencyStable = false
+                var uploadThroughputStable = false
+                var downloadThroughputStable = false
+
+                delay(1000)
+                // While we don't have stability across the board
+                while (!(uploadLatencyStable && downloadLatencyStable && uploadThroughputStable && downloadThroughputStable)) {
+                    // Spawn new connections
+                    // DownloadsConnections
+                    for (i in 1..CONNECTION_INCREASE_COUNT) {
+                        numDownloadConnections += 1
+                        launch(newSingleThreadContext("D:${numDownloadConnections}")) {
+                            val connection = org.responsiveness.main.DownloadConnection(URL_TO_GET, downloadLatencyChannel, downloadThroughputChannel, "D${numDownloadConnections}")
+                            connection.loadConnection()
+                            delay(1000)
+                            connection.startProbes(URL_TO_PROBE)
+                        }
+                    }
+                    // UploadConnections
+                    for (i in 1..CONNECTION_INCREASE_COUNT) {
+                        numUploadConnections += 1
+                        launch(newSingleThreadContext("U:${numUploadConnections}")) {
+                            val connection = org.responsiveness.main.UploadConnection(URL_TO_POST, uploadLatencyChannel, uploadThroughputChannel, "U${numUploadConnections}")
+                            connection.loadConnection()
+                            delay(1000)
+                            connection.startProbes(URL_TO_PROBE)
+                        }
+                    }
+
+                    delay(1000)
+                    // Retest Stability at the end
+                    uploadLatencyStable = uploadLatencyStability.isStable()
+                    downloadLatencyStable = downloadLatencyStability.isStable()
+                    uploadThroughputStable = uploadThroughputStability.isStable()
+                    downloadThroughputStable = downloadThroughputStability.isStable()
+
+                    println("###${(ms(System.nanoTime() - testStartTime) / 1000)}s: UploadLatency:${if (uploadLatencyStable) "" else " not"} stable | DownloadLatency:${if (downloadLatencyStable) "" else " not"} stable | UploadThroughput:${if (uploadThroughputStable) "" else " not"} stable | DownloadThroughput:${if (downloadThroughputStable) "" else " not"} stable")
+                }
+                System.exit(0)
+            }
+            println("REACHED AFTER LAUNCHES ####################################")
         }
+        println("REACHED AFTER BLOCK ####################################")
+        System.exit(0)
     }
 }
