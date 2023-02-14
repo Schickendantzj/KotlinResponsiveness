@@ -8,6 +8,7 @@ import io.ktor.client.plugins.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.ktor.network.sockets.*
 import io.ktor.utils.io.*
 import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
@@ -20,6 +21,7 @@ import java.net.Proxy
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import javax.net.ssl.SSLEngineResult.HandshakeStatus
 import kotlin.coroutines.coroutineContext
 import kotlin.system.measureNanoTime
 import kotlin.text.toByteArray
@@ -105,7 +107,7 @@ abstract class Connection(latencyChannel: Channel<DataPoint>, val connectionID: 
                     // Create a new connection pool to make sure we don't reuse the old ones
                     // Force max connections to be 1
                     // TODO Test that it is only 1 connection; Seems so
-                    connectionPool(ConnectionPool(1, 2, TimeUnit.SECONDS))
+                    connectionPool(ConnectionPool(2, 10, TimeUnit.SECONDS))
 
                     // Add listener to measure RTT
                     eventListenerFactory(listenerFactory)
@@ -163,6 +165,7 @@ abstract class Connection(latencyChannel: Channel<DataPoint>, val connectionID: 
         }
     }
 }
+
 
 class DownloadConnection(private val url: String, latencyChannel: Channel<DataPoint>, val throughputChannel: Channel<HookDataPoint>, connectionID: String) : Connection(latencyChannel, connectionID) {
     override suspend fun loadConnection(): Boolean {
@@ -339,6 +342,31 @@ class UploadConnection(private val url: String, latencyChannel: Channel<DataPoin
     }
 }
 
+class ForeignConnection(private val url: String, latencyChannel: Channel<DataPoint>, connectionID: String) : Connection(latencyChannel, connectionID) {
+    companion object {
+        val connections = ArrayList<okhttp3.Connection>()
+    }
+
+    // TODO CLEAN
+    override suspend fun loadConnection(): Boolean {
+        // Can only call this once and return true
+        if (isLoaded) {
+            return false
+        }
+        isLoaded = true
+
+        // TODO Confirm Async?
+        with(CoroutineScope(coroutineContext)) {
+            launch(newSingleThreadContext("loadConnection:${connectionID}")) {
+                client.get(url) {
+                    header("ID", connectionID)
+                }
+            }
+        }
+        return true
+    }
+}
+
 class Probe(val url: String, val startTime: Long) {
     val id: Int = Probe.getID()
     var finishTime: Long = -1L
@@ -388,11 +416,12 @@ class ConnectionStats(val startTime: Long) {
     var socketAcquired: Long = -1   // Socket acquired // -2 for failed acquire
 }
 
-// FROM: https://square.github.io/okhttp/features/events/
+// Reference for events: https://square.github.io/okhttp/features/events/
 // We can use an event listener factory to create a unique event listener for EACH call
 class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String): EventListener.Factory {
     var loadListener: Listener? = null
     var probeListeners = HashMap<String, Listener>()
+    var loadConnection: okhttp3.Connection? = null
 
     // Says it is an error to mutate Call here. DO NOT MUTATE Call.
     override fun create(call: Call): EventListener {
@@ -401,21 +430,40 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
             println("ERROR: NO ID HEADER IN REQUEST")
             callID = ""
         }
-        val listener = Listener(callID, connectionID, System.nanoTime(), channel)
+        // Regardless of what happens we have to return a listener
+        // This one does nothing with the connection
+        var listener = Listener(callID, connectionID, System.nanoTime(), channel) { connection ->
+            true
+        }
+
+        // If it is a probe
         if (callID.startsWith("P")) {
             if (probeListeners.containsKey(callID)) {
                 println("CRITICAL ERROR: PROBE ID IS NOT UNIQUE")
             } else {
+                listener = Listener(callID, connectionID, System.nanoTime(), channel) { connection ->
+                    (loadConnection != null) && (connection.socket() == loadConnection!!.socket())
+                }
                 probeListeners[callID] = listener
             }
+
+        // If it is a data load call
         } else {
-            loadListener = listener
+            listener = Listener(callID, connectionID, System.nanoTime(), channel) { connection ->
+                // https://docs.oracle.com/javase/8/docs/api/java/net/Socket.html?is-external=true
+                // connection.socket().setPerformancePreferences(0,2,0) // No effect after socket acquired
+                loadConnection = connection
+                (connection != null)
+            }
         }
         return listener
     }
 
-    class Listener(val callID: String, val connectionID: String, val startTime: Long, val latencyChannel: Channel<DataPoint>) : EventListener() {
-        val connectionStats = ConnectionStats(startTime) // TODO: consider using the same startTime as passed vs System nanotime
+    class Listener(val callID: String, val connectionID: String, val startTime: Long, val latencyChannel: Channel<DataPoint>,
+        val gotConnectionCallback: (okhttp3.Connection) -> Boolean) : EventListener() {
+        val connectionStats = ConnectionStats(startTime)
+        lateinit var connection: okhttp3.Connection
+
         // https://square.github.io/okhttp/3.x/okhttp/okhttp3/EventListener.html#EventListener--
 
         // OKHttp3 Call events
@@ -457,6 +505,19 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
             if (handshake != null) {
                 // println("${this.ID}: TLS connection finished: ${JvmMain.currTimeDelta(startTime)} ms | version: ${handshake.tlsVersion}")
                 println("${this.callID}:${this.connectionID}: TLS connection took: ${ms(connectionStats.tlsEnd - connectionStats.tlsStart)} ms | version: ${handshake.tlsVersion}")
+                if (this.callID.startsWith("F")) {
+                    val myself = this
+                    GlobalScope.launch {
+                        latencyChannel.send(
+                            ProbeDataPoint(
+                                ms(connectionStats.tlsEnd - connectionStats.tlsStart),
+                                myself.connectionID,
+                                myself.callID,
+                                handshake.tlsVersion.toString()
+                            )
+                        )
+                    }
+                }
             } else {
                 // println("${this.ID}: TLS connection failed: ${JvmMain.currTimeDelta(startTime)} ms")
                 println("${this.callID}:${this.connectionID}: TLS connection FAILED! took: ${ms(connectionStats.tlsEnd - connectionStats.tlsStart)} ms")
@@ -492,19 +553,19 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
             // println("${this.ID}: ResponseHeaderStarted: ${JvmMain.currTimeDelta(startTime)} ms")
 
             // println("${this.callID}:${this.connectionID}: HTTP (request header start - response header start) took: ${ms(connectionStats.responseHeaderStart - connectionStats.requestHeaderStart)} ms")
-            if (this.callID.startsWith("P")) {
-                    val myself = this
-                    GlobalScope.launch {
-                        latencyChannel.send(
-                            ProbeDataPoint(
-                                ms(connectionStats.responseHeaderStart - connectionStats.requestHeaderStart),
-                                myself.connectionID,
-                                myself.callID,
-                                "HTTP"
-                            )
+            if (this.callID.startsWith("P") || this.callID.startsWith("F")) {
+                val myself = this
+                GlobalScope.launch {
+                    latencyChannel.send(
+                        ProbeDataPoint(
+                            ms(connectionStats.responseHeaderStart - connectionStats.requestHeaderStart),
+                            myself.connectionID,
+                            myself.callID,
+                            "HTTP"
                         )
-                    }
+                    )
                 }
+            }
     }
 
         override fun responseBodyStart(call: Call) {
@@ -516,11 +577,31 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
         // Socket events
         override fun connectStart(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy) {
             connectionStats.socketStart = System.nanoTime()
-            println("${this.callID}:${this.connectionID}: connectStart SOCKET START ATTEMPT: ${JvmMain.currTimeDelta(startTime)} ms")
+            // println("${this.callID}:${this.connectionID}: connectStart SOCKET START ATTEMPT: ${JvmMain.currTimeDelta(startTime)} ms")
         }
 
         override fun connectEnd(call: Call, inetSocketAddress: InetSocketAddress, proxy: Proxy, protocol: Protocol?) {
-            println("${this.callID}:${this.connectionID}: connectEnd SOCKET STARTED: ${JvmMain.currTimeDelta(startTime)} ms | protocol: ${protocol}")
+            connectionStats.socketEnd = System.nanoTime()
+            // If our tls start is defined then we have a secure socket so our actual socket connection time
+            // is from connectStart to when we start our tls connection (tlsStart)
+            if (connectionStats.tlsStart != -1L) {
+                connectionStats.socketEnd = connectionStats.tlsStart
+            }
+
+            // println("${this.callID}:${this.connectionID}: connectEnd SOCKET STARTED: ${JvmMain.currTimeDelta(startTime)} ms | protocol: ${protocol}")
+            if (this.callID.startsWith("F")) {
+                val myself = this
+                GlobalScope.launch {
+                    latencyChannel.send(
+                        ProbeDataPoint(
+                            ms(connectionStats.socketEnd - connectionStats.socketStart),
+                            myself.connectionID,
+                            myself.callID,
+                            "Socket"
+                        )
+                    )
+                }
+            }
         }
 
         override fun connectionAcquired(call: Call, connection: okhttp3.Connection) {
@@ -528,6 +609,16 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
             // Confirm the load connection is a h2
             // Record the tls version to calculate the # of round trips it contains
             connectionStats.socketAcquired = System.nanoTime()
+            // println("${this.callID} socket acquired")
+
+            // If our connection was the same as the load connection or is the load connection
+            if (gotConnectionCallback(connection)) {
+                // Do nothing
+            } else {
+                println("${this.callID} : ${this.connectionID}: connection acquired is not the same as load connection")
+            }
+
+
             // println("${this.ID}: SOCKET ACQUIRED: ${JvmMain.currTimeDelta(startTime)} ms | Local Port: ${connection.socket().localPort}")
         }
     }

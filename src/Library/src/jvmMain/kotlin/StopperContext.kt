@@ -1,5 +1,8 @@
 package org.responsiveness.main
 
+// I have class that has references to children (same class)
+// I get a stop signal, I stop all my children, then I stop myself.
+
 
 // Class meant to be used to stop all launched coroutines across the board "safely"
 class StopperContext(stop: Boolean) {

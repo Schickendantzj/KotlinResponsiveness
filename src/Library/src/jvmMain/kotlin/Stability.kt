@@ -39,7 +39,7 @@ abstract class Stability {
     // caller controls the context it runs within
     abstract suspend fun start()
     protected abstract suspend fun receive()
-
+    abstract fun getLastMovingPoint(): Float
 
     fun calculateMean(points: ArrayList<Float>): Double {
         var mean = 0.0
@@ -91,6 +91,15 @@ class ThroughputStability(val ID: String, val hooksChannel: Channel<HookDataPoin
     private var instantDataPointsFile = File("./Data/${timestamp.format(fileFormatter)}/instantThroughput${ID}.csv")
     private var movingDataPointsFile = File("./Data/${timestamp.format(fileFormatter)}/movingThroughput${ID}.csv")
 
+    override fun getLastMovingPoint(): Float {
+        var last = 0f
+        try {
+            last = movingDataPoints.last()
+        } catch (e: NoSuchElementException) {
+            // Do nothing
+        }
+        return last
+    }
 
     override fun isStable(): Boolean {
 
@@ -210,6 +219,15 @@ class LatencyStability(val ID: String, val channel: Channel<DataPoint>, val numb
     private var instantDataPointsFile = File("./Data/${timestamp.format(fileFormatter)}/instantLatency${ID}.csv")
     private var movingDataPointsFile = File("./Data/${timestamp.format(fileFormatter)}/movingLatency${ID}.csv")
 
+    override fun getLastMovingPoint(): Float {
+        var last = 0f
+        try {
+            last = movingDataPoints.last()
+        } catch (e: NoSuchElementException) {
+            // Do nothing
+        }
+        return last
+    }
 
     override fun isStable(): Boolean {
 

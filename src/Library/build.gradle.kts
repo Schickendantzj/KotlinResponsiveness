@@ -1,5 +1,7 @@
 plugins {
-    kotlin("multiplatform") version "1.7.10"
+    kotlin("multiplatform") version "1.8.10"
+    kotlin("plugin.serialization") version("1.8.10")
+    id("maven-publish")
 }
 
 group = "me.jeroen"
@@ -22,7 +24,7 @@ kotlin {
     js(BOTH) {
         browser {
             commonWebpackConfig {
-                cssSupport.enabled = true
+                // cssSupport.enabled = true
             }
         }
     }
@@ -45,7 +47,15 @@ kotlin {
                 implementation("io.ktor:ktor-client-cio:$ktor_version")
                 implementation("io.ktor:ktor-client-java:$ktor_version")
                 implementation("io.ktor:ktor-client-okhttp:$ktor_version")
+
+                // to parse json
+                implementation("io.ktor:ktor-serialization-kotlinx-json:$ktor_version")
+                implementation("io.ktor:ktor-client-content-negotiation:$ktor_version")
+
+                // to utilize the okhttp listener factory
                 implementation("com.squareup.okhttp3:okhttp:$okhttp_version")
+
+
             }
         }
         val commonTest by getting {

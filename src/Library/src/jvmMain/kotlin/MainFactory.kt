@@ -2,6 +2,9 @@ package org.responsiveness.main
 
 import kotlinx.coroutines.*
 
+import io.ktor.client.plugins.contentnegotiation.*
+import io.ktor.serialization.kotlinx.json.*
+
 
 import io.ktor.client.*
 import io.ktor.client.call.*
@@ -18,6 +21,7 @@ import io.ktor.http.*
 import io.ktor.http.Headers
 import io.ktor.http.cio.Request
 import io.ktor.http.content.*
+import io.ktor.serialization.*
 import io.ktor.util.*
 import io.ktor.util.date.*
 import io.ktor.utils.io.* // ByteReadChannel
@@ -25,6 +29,9 @@ import io.ktor.utils.io.core.*
 import io.ktor.utils.io.errors.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.*
+import kotlinx.serialization.json.Json
 import okhttp3.*
 import okhttp3.EventListener
 import java.io.InputStream
@@ -37,6 +44,7 @@ import kotlin.system.measureNanoTime
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
+import java.security.KeyStore.TrustedCertificateEntry
 import java.security.cert.Certificate
 import java.util.*
 import java.util.concurrent.TimeUnit
@@ -44,21 +52,100 @@ import java.util.concurrent.atomic.AtomicInteger
 import javax.xml.crypto.Data
 import kotlin.collections.ArrayList
 import kotlin.properties.Delegates
-
-
-//var io: io.ktor.client.plugins.HttpCallValidator
+import kotlin.system.exitProcess
 
 // CONFIG
+val URL_CONFIG =   "https://mensura.cdn-apple.com/api/v1/gm/config" // "https://rpm.obs.cr:4043/config" //
 val URL_TO_GET =  "https://mensura.cdn-apple.com/api/v1/gm/large" // "https://rpm.obs.cr/large/" //
 val URL_TO_POST =  "https://mensura.cdn-apple.com/api/v1/gm/slurp" //"https://rpm.obs.cr:443/slurp" //
 val URL_TO_PROBE = "https://mensura.cdn-apple.com/api/v1/gm/small" //
 
 val INITIAL_CONNECTION_COUNT = 4  // Initial Amount of Load Generating Connections (for upload and download)
 val CONNECTION_INCREASE_COUNT = 1 // Amount to increase per cycle (second usually) of the algorithm
+val FOREIGN_CONNECTION_COUNT = 1  // Amount of foreign connections to establish per second
 
 
 // GLOBAL USED
 var SEND = ""
+
+
+@Serializable
+data class Config(
+    val version: Float,
+    val test_endpoint: String? = null,
+    val urls: URLS,
+)
+
+
+// Allow missing values to be null
+@Serializable
+data class URLS(
+    val small_https_download_url: String? = null,
+    val large_https_download_url: String? = null,
+    val https_upload_url: String? = null,
+    val small_download_url: String? = null,
+    val large_download_url: String? = null,
+    val upload_url: String? = null,
+)
+
+
+class URL(val config: Config, val bodyText: String) {
+    lateinit var download: String
+    lateinit var upload: String
+    lateinit var probe: String
+    var error: String? = null  // Is null unless there is a problem
+
+    init {
+        // Always try https first
+        // Upload
+        if (config.urls.https_upload_url != null) {
+            this.upload = config.urls.https_upload_url
+        } else if (config.urls.upload_url != null) {
+            this.upload = config.urls.upload_url
+        } else {
+            if (error == null) {
+                error = "No http/https upload url parsed from json\n"
+            } else {
+                error += "No http/https upload url parsed from json\n"
+            }
+        }
+
+        // Download (download large)
+        if (config.urls.large_https_download_url != null) {
+            this.download = config.urls.large_https_download_url
+        } else if (config.urls.large_download_url != null) {
+            this.download = config.urls.large_download_url
+        } else {
+            if (error == null) {
+                error = "No http/https large download url parsed from json\n"
+            } else {
+                error += "No http/https large download url parsed from json\n"
+            }
+        }
+
+        // Probe (download small)
+        if (config.urls.small_https_download_url != null) {
+            this.probe = config.urls.small_https_download_url
+        } else if (config.urls.small_download_url != null) {
+            this.probe = config.urls.small_download_url
+        } else {
+            if (error == null) {
+                error = "No http/https (probe) small download url parsed from json\n"
+            } else {
+                error += "No http/https (probe) small download url parsed from json\n"
+            }
+        }
+    }
+}
+
+
+suspend fun getURLS(client: HttpClient, url: String): URL {
+    val response = client.get(url) {}
+    // val bodyText = response.bodyAsText()
+    // println(response.bodyAsText())
+    val config: Config = response.body()
+    return URL(config, response.bodyAsText())
+}
 
 
 actual object MainFactory {
@@ -202,38 +289,36 @@ object JvmMain : Main {
         return ((System.nanoTime() - startTime) / 1_000_000.0)
     }
 
-    fun API() {
-
-    }
-
     override fun main(args: Array<String>): Unit {
         // Initialize global send
         SEND = "x"
         for (i in 0..16) {
             SEND += SEND
         }
-        println("Send length: ${SEND.length}")
-
-        // JAVA CLIENT
-        // From https://ktor.io/docs/http-client-engines.html#java
-//        val client = io.ktor.client.HttpClient(Java) {
-//            engine {
-//                protocolVersion = java.net.http.HttpClient.Version.HTTP_2
-//            }
-//        }
 
 
-//        // Here I am going to intercept the send call to define my own
-//        // Using https://github.com/ktorio/ktor/blob/main/ktor-client/ktor-client-okhttp/jvm/src/io/ktor/client/engine/okhttp/OkHttpEngine.kt
-//        client.plugin(HttpSend).intercept { request ->
-//            println(request.headers.get("ID"))
-//
-//            execute(request)
-//        }
+        // Initial Config Retrieval
+        val client = HttpClient(OkHttp) {
+            install(ContentNegotiation) {
+                json(Json {
+                    ignoreUnknownKeys = true
+                    prettyPrint = true
+                    isLenient = true
+                })
+            }
+        }
 
-        // DEFAULT CLIENT (NO HTTP2)
-//        val client = io.ktor.client.HttpClient(CIO)
+        var urls: URL
+        runBlocking{
+            urls = getURLS(client, URL_CONFIG)
+        }
 
+        if (urls.error != null) {
+            println("Had a problem parsing config json urls: ${urls.error}")
+            exitProcess(0)
+        }
+
+        // Initialize Test Channels for Stability
 
         var context = StopperContext(false)
 
@@ -249,34 +334,44 @@ object JvmMain : Main {
         var downloadThroughputChannel = Channel<HookDataPoint>()
         var downloadThroughputStability = ThroughputStability("Download", downloadThroughputChannel, 5, 10f)
 
+        // Foreign Latency Channel & Stability
+        var foreignLatencyChannel = Channel<DataPoint>()
+        var foreignLatencyStability = LatencyStability("Foreign", foreignLatencyChannel, 5, 10f)
+
+
         var numUploadConnections = 0
         var numDownloadConnections = 0
+        var numForeignConnections = 0
+
         runBlocking {
             // Start internal receiving
             launch {uploadLatencyStability.start()}
             launch {downloadLatencyStability.start()}
             launch {uploadThroughputStability.start()}
             launch {downloadThroughputStability.start()}
+            launch {foreignLatencyStability.start()}
 
 
             // Download Starts
             for (i in 1..INITIAL_CONNECTION_COUNT) {
                 numDownloadConnections += 1
-                launch(newSingleThreadContext("D:${numDownloadConnections}")) {
-                    val connection = org.responsiveness.main.DownloadConnection(URL_TO_GET, downloadLatencyChannel, downloadThroughputChannel, "D${numDownloadConnections}")
+                val numDown = numDownloadConnections
+                launch(newSingleThreadContext("D:$numDown")) {
+                    val connection = org.responsiveness.main.DownloadConnection(urls.download, downloadLatencyChannel, downloadThroughputChannel, "D$numDown")
                     connection.loadConnection()
                     delay(1000)
-                    connection.startProbes(URL_TO_PROBE)
+                    connection.startProbes(urls.probe)
                 }
             }
             // Upload Starts
             for (i in 1..INITIAL_CONNECTION_COUNT) {
                 numUploadConnections += 1
-                launch(newSingleThreadContext("U:${numUploadConnections}")) {
-                    val connection = org.responsiveness.main.UploadConnection(URL_TO_POST, uploadLatencyChannel, uploadThroughputChannel, "U${numUploadConnections}")
+                val numUp = numUploadConnections
+                launch(newSingleThreadContext("U:$numUp")) {
+                    val connection = org.responsiveness.main.UploadConnection(urls.upload, uploadLatencyChannel, uploadThroughputChannel, "U$numUp")
                     connection.loadConnection()
                     delay(1000)
-                    connection.startProbes(URL_TO_PROBE)
+                    connection.startProbes(urls.probe)
                 }
             }
 
@@ -285,42 +380,68 @@ object JvmMain : Main {
                 var testStartTime = System.nanoTime()
                 var uploadLatencyStable = false
                 var downloadLatencyStable = false
+                var foreignLatencyStable = false
                 var uploadThroughputStable = false
                 var downloadThroughputStable = false
 
                 delay(1000)
                 // While we don't have stability across the board
-                while (!(uploadLatencyStable && downloadLatencyStable && uploadThroughputStable && downloadThroughputStable)) {
+                while (!(uploadLatencyStable && downloadLatencyStable && uploadThroughputStable && downloadThroughputStable && foreignLatencyStable)) {
                     // Spawn new connections
                     // DownloadsConnections
                     for (i in 1..CONNECTION_INCREASE_COUNT) {
                         numDownloadConnections += 1
-                        launch(newSingleThreadContext("D:${numDownloadConnections}")) {
-                            val connection = org.responsiveness.main.DownloadConnection(URL_TO_GET, downloadLatencyChannel, downloadThroughputChannel, "D${numDownloadConnections}")
+                        val numDown = numDownloadConnections
+                        launch(newSingleThreadContext("D:$numDown")) {
+                            val connection = org.responsiveness.main.DownloadConnection(urls.download, downloadLatencyChannel, downloadThroughputChannel, "D$numDown")
                             connection.loadConnection()
                             delay(1000)
-                            connection.startProbes(URL_TO_PROBE)
+                            connection.startProbes(urls.probe)
                         }
                     }
                     // UploadConnections
                     for (i in 1..CONNECTION_INCREASE_COUNT) {
                         numUploadConnections += 1
-                        launch(newSingleThreadContext("U:${numUploadConnections}")) {
-                            val connection = org.responsiveness.main.UploadConnection(URL_TO_POST, uploadLatencyChannel, uploadThroughputChannel, "U${numUploadConnections}")
+                        val numUp = numUploadConnections
+                        launch(newSingleThreadContext("U:$numUp")) {
+                            val connection = org.responsiveness.main.UploadConnection(urls.upload, uploadLatencyChannel, uploadThroughputChannel, "U$numUp")
                             connection.loadConnection()
                             delay(1000)
-                            connection.startProbes(URL_TO_PROBE)
+                            connection.startProbes(urls.probe)
                         }
                     }
+
+                    // Spawn all foreign connections
+                    // We don't want to add delay normal test loop
+                    launch {
+                        for (i in 1..FOREIGN_CONNECTION_COUNT) {
+                            for (x in 1..10) {
+                                numForeignConnections += 1
+                                val numForeign = numForeignConnections
+                                // TODO use single thread context?
+                                launch {
+                                    val connection = org.responsiveness.main.ForeignConnection(urls.probe, foreignLatencyChannel, "F$numForeign")
+                                    connection.loadConnection()
+                                }
+                                // Pause for the amount needed
+                                delay((1000 / 10 / FOREIGN_CONNECTION_COUNT).toLong())
+                            }
+                        }
+                    }
+
 
                     delay(1000)
                     // Retest Stability at the end
                     uploadLatencyStable = uploadLatencyStability.isStable()
                     downloadLatencyStable = downloadLatencyStability.isStable()
+                    foreignLatencyStable = foreignLatencyStability.isStable()
                     uploadThroughputStable = uploadThroughputStability.isStable()
                     downloadThroughputStable = downloadThroughputStability.isStable()
 
-                    println("###${(ms(System.nanoTime() - testStartTime) / 1000)}s: UploadLatency:${if (uploadLatencyStable) "" else " not"} stable | DownloadLatency:${if (downloadLatencyStable) "" else " not"} stable | UploadThroughput:${if (uploadThroughputStable) "" else " not"} stable | DownloadThroughput:${if (downloadThroughputStable) "" else " not"} stable")
+
+                    println("###${(ms(System.nanoTime() - testStartTime) / 1000)}s: UploadLatency:${if (uploadLatencyStable) "" else " not"} stable | DownloadLatency:${if (downloadLatencyStable) "" else " not"} stable | ForeignLatency:${if (foreignLatencyStable) "" else " not"} stable | UploadThroughput:${if (uploadThroughputStable) "" else " not"} stable | DownloadThroughput:${if (downloadThroughputStable) "" else " not"} stable")
+                    println("###Upload Latency: ${uploadLatencyStability.getLastMovingPoint()} ms | Download Latency: ${downloadLatencyStability.getLastMovingPoint()} ms | Foreign Latency: ${foreignLatencyStability.getLastMovingPoint()} ms")
+                    println("###Upload Throughput: ${uploadThroughputStability.getLastMovingPoint()} Mb/s | Download Throughput: ${downloadThroughputStability.getLastMovingPoint()} Mb/s")
                 }
                 System.exit(0)
             }
