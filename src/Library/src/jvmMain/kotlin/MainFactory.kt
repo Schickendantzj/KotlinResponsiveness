@@ -289,7 +289,8 @@ object JvmMain : Main {
         return ((System.nanoTime() - startTime) / 1_000_000.0)
     }
 
-    override fun main(args: Array<String>): Unit {
+    override fun main(args: Array<String>, outputChannel: Channel<String>): Unit {
+
         // Initialize global send
         SEND = "x"
         for (i in 0..16) {
@@ -438,6 +439,10 @@ object JvmMain : Main {
                     uploadThroughputStable = uploadThroughputStability.isStable()
                     downloadThroughputStable = downloadThroughputStability.isStable()
 
+
+                    outputChannel.send("###${(ms(System.nanoTime() - testStartTime) / 1000)}s: UploadLatency:${if (uploadLatencyStable) "" else " not"} stable | DownloadLatency:${if (downloadLatencyStable) "" else " not"} stable | ForeignLatency:${if (foreignLatencyStable) "" else " not"} stable | UploadThroughput:${if (uploadThroughputStable) "" else " not"} stable | DownloadThroughput:${if (downloadThroughputStable) "" else " not"} stable")
+                    outputChannel.send("###Upload Latency: ${uploadLatencyStability.getLastMovingPoint()} ms | Download Latency: ${downloadLatencyStability.getLastMovingPoint()} ms | Foreign Latency: ${foreignLatencyStability.getLastMovingPoint()} ms")
+                    outputChannel.send("###Upload Throughput: ${uploadThroughputStability.getLastMovingPoint()} Mb/s | Download Throughput: ${downloadThroughputStability.getLastMovingPoint()} Mb/s")
 
                     println("###${(ms(System.nanoTime() - testStartTime) / 1000)}s: UploadLatency:${if (uploadLatencyStable) "" else " not"} stable | DownloadLatency:${if (downloadLatencyStable) "" else " not"} stable | ForeignLatency:${if (foreignLatencyStable) "" else " not"} stable | UploadThroughput:${if (uploadThroughputStable) "" else " not"} stable | DownloadThroughput:${if (downloadThroughputStable) "" else " not"} stable")
                     println("###Upload Latency: ${uploadLatencyStability.getLastMovingPoint()} ms | Download Latency: ${downloadLatencyStability.getLastMovingPoint()} ms | Foreign Latency: ${foreignLatencyStability.getLastMovingPoint()} ms")

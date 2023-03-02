@@ -43,6 +43,20 @@ kotlin {
             val ktor_version: String by project
             val okhttp_version: String by project
             dependencies {
+                // Moved all dependencies to jvmMain
+                val coroutines_version = "1.6.4"
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:$coroutines_version")
+            }
+        }
+        val commonTest by getting {
+            dependencies {
+                implementation(kotlin("test"))
+            }
+        }
+        val jvmMain by getting {
+            val ktor_version: String by project
+            val okhttp_version: String by project
+            dependencies {
                 implementation("io.ktor:ktor-client-core:$ktor_version")
                 implementation("io.ktor:ktor-client-cio:$ktor_version")
                 implementation("io.ktor:ktor-client-java:$ktor_version")
@@ -54,16 +68,8 @@ kotlin {
 
                 // to utilize the okhttp listener factory
                 implementation("com.squareup.okhttp3:okhttp:$okhttp_version")
-
-
             }
         }
-        val commonTest by getting {
-            dependencies {
-                implementation(kotlin("test"))
-            }
-        }
-        val jvmMain by getting
         val jvmTest by getting
         val jsMain by getting
         val jsTest by getting

@@ -7,6 +7,9 @@ import android.view.View
 import android.view.ViewGroup
 import androidx.navigation.fragment.findNavController
 import com.example.responsivenessapp.databinding.FragmentFirstBinding
+import kotlinx.coroutines.channels.Channel
+
+import org.responsiveness.main.JvmMain.main
 
 /**
  * A simple [Fragment] subclass as the default destination in the navigation.
@@ -33,6 +36,7 @@ class FirstFragment : Fragment() {
         super.onViewCreated(view, savedInstanceState)
 
         binding.buttonFirst.setOnClickListener {
+            main(arrayOf(""), Channel<String>())
             findNavController().navigate(R.id.action_FirstFragment_to_SecondFragment)
         }
     }
