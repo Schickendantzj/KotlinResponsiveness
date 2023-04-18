@@ -1,0 +1,3 @@
+Most of the tests that were done, were test revolving around the measurements that I used. These measurements include the download and upload throughput measurements. This required me to measure the actual throughput through an observed class, as well as, the integrated hook within Ktor. Another set of measurements is the TCP/TLS handshake and HTTP request to response time. This required me to use the OkHttp hooks for network events and confirm what it was measuring for each hook. Lastly, I had to confirm that calculations used within the tool. I spent a good chunk of time testing within Android app and fixing problems that didn't allow the library call to run to completion.  
+
+In the future I also aim to provide a testing suite for the library itself.  

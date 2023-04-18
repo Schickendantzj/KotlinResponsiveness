@@ -13,16 +13,14 @@ The library will offer an API call to allow applications to integrate the respon
 The Android app will utilize this API call to give the Android platform access to the responsiveness test.
 
 # Table of Contents
-1. [Original Project Description](/senior_design_documentation/documents/Project-Description.md)
-2. User Stories and Design Diagrams
-   - [User Stories](/senior_design_documentation/documents/User-Stories.md)
-   - [Design Diagrams](/senior_design_documentation/documents/Design-Diagrams.md)
-3. Project Tasks and Timeline
-   - [Task List](/senior_design_documentation/documents/Task-List.md)
-   - [Timeline](/senior_design_documentation/documents/Timeline.md)
-4. [ABET Concerns Essay](/senior_design_documentation/documents/Project-Constraint-Essay.docx)
-5. [PowerPoint Slideshow](/senior_design_documentation/documents/Presentation.pdf)
-6. [Self-Assessment Essay](/senior_design_documentation/documents/Self-Assessment-Essay.docx)
-7. [Professional Biography](/senior_design_documentation/documents/Professional-Biography.md)
+1. [Fall Readme](/senior_design_documentation/documents/Original-Readme.md) 
+2. [User Interface Specification/Manual](/senior_design_documentation/documents/User-Interface-Specification.md)
+3. [Tests](/senior_design_documentation/documents/Tests.md)
+4. [Spring Final Presentation](https://mailuc-my.sharepoint.com/:f:/g/personal/schickjn_mail_uc_edu/EqIuOTtYCVpHrptzNCm7BQABQQNpfz3c-E9QFKgg-Sqw8A)
+5. [Final Expo Poster](/senior_design_documentation/ExpoPoster/)
+6. Self-Assessment Essays
+   - [Fall/Initial](/senior_design_documentation/documents/Self-Assessment-Essay.docx)
+   - [Spring/Final](/senior_design_documentation/documents/SelfReflection.docx)
+7. [Summary of Hours](/senior_design_documentation/documents/Hours.md)
 8. Budget 0$
 9. Appendix (None)
