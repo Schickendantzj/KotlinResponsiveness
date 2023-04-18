@@ -9,4 +9,15 @@
 
     <string name="hello_first_fragment">Hello first fragment</string>
     <string name="hello_second_fragment">Hello second fragment. Arg: %1$s</string>
+    <string name="StartTest">Start Test</string>
+    <string name="EnterUrl">Enter URL to Endpoint</string>
+    <string name="DefaultUrl">https://mensura.cdn-apple.com/api/v1/gm/config</string>
+    <string name="TestURL">Test URL</string>
+    <!-- TODO: Remove or change this placeholder text -->
+    <string name="hello_blank_fragment">Hello blank fragment</string>
+    <string name="EndpointUrl">Endpoint URL</string>
+    <string name="EndpointValid">Endpoint Valid</string>
+    <string name="EndpointBad">Endpoint Bad</string>
+    <string name="EndpointResponse">Endpoint Response:</string>
+    <string name="ReturnConfigs">Return</string>
 </resources>

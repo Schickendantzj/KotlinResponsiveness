@@ -1,12 +1,14 @@
 package com.example.responsivenessapp
 
 import android.os.Bundle
+import android.view.Display
 import androidx.fragment.app.Fragment
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import androidx.navigation.fragment.findNavController
 import com.example.responsivenessapp.databinding.FragmentFirstBinding
+import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 
 import org.responsiveness.main.JvmMain.main
@@ -35,9 +37,33 @@ class FirstFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
-        binding.buttonFirst.setOnClickListener {
-            main(arrayOf(""), Channel<String>())
-            findNavController().navigate(R.id.action_FirstFragment_to_SecondFragment)
+        binding.outputText.setText("")
+
+        binding.buttonStartTest.setOnClickListener {
+            // TODO: remove this and refactor libary to exclude file writing when wanted.
+            val path = context!!.getExternalFilesDir(null)!!
+            val outputChannel = Channel<String>()
+            var output = ""
+            GlobalScope.launch (newSingleThreadContext("test")) {
+                launch(newSingleThreadContext("output")) {
+                    for (out in outputChannel) {
+                        output = out +  "\n" + output
+                    }
+                }
+                launch(newSingleThreadContext("updateText")) {
+                    while (true) {
+                        launch(Dispatchers.Main) {
+                            binding.outputText.setText(output)
+                        }
+                        delay(100L)
+                    }
+                }
+                main(arrayOf(""), binding.EndPointUrl.text.toString(), outputChannel, path, false)
+            }
+        }
+
+        binding.buttonTestURL.setOnClickListener {
+            findNavController().navigate(R.id.action_FirstFragment_to_test_url)
         }
     }
 

@@ -34,12 +34,14 @@ import kotlinx.serialization.*
 import kotlinx.serialization.json.Json
 import okhttp3.*
 import okhttp3.EventListener
+import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 import java.lang.reflect.TypeVariable
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.CoroutineContext
 import kotlin.system.measureNanoTime
+import java.nio.file.Paths
 
 import java.net.InetAddress
 import java.net.InetSocketAddress
@@ -51,8 +53,10 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import javax.xml.crypto.Data
 import kotlin.collections.ArrayList
+import kotlin.math.floor
 import kotlin.properties.Delegates
 import kotlin.system.exitProcess
+import kotlin.time.DurationUnit
 
 // CONFIG
 val URL_CONFIG =   "https://mensura.cdn-apple.com/api/v1/gm/config" // "https://rpm.obs.cr:4043/config" //
@@ -60,10 +64,11 @@ val URL_TO_GET =  "https://mensura.cdn-apple.com/api/v1/gm/large" // "https://rp
 val URL_TO_POST =  "https://mensura.cdn-apple.com/api/v1/gm/slurp" //"https://rpm.obs.cr:443/slurp" //
 val URL_TO_PROBE = "https://mensura.cdn-apple.com/api/v1/gm/small" //
 
-val INITIAL_CONNECTION_COUNT = 4  // Initial Amount of Load Generating Connections (for upload and download)
+val INITIAL_CONNECTION_COUNT = 1 // Initial Amount of Load Generating Connections (for upload and download)
 val CONNECTION_INCREASE_COUNT = 1 // Amount to increase per cycle (second usually) of the algorithm
 val FOREIGN_CONNECTION_COUNT = 1  // Amount of foreign connections to establish per second
 
+val NUM_CONNECTIONS_TO_PROBE = 1 // Number of Connections (up/down) to probe, 0 for all
 
 // GLOBAL USED
 var SEND = ""
@@ -141,10 +146,42 @@ class URL(val config: Config, val bodyText: String) {
 
 suspend fun getURLS(client: HttpClient, url: String): URL {
     val response = client.get(url) {}
-    // val bodyText = response.bodyAsText()
-    // println(response.bodyAsText())
-    val config: Config = response.body()
+    var config: Config
+    if (response.status == HttpStatusCode.OK) {
+        config = response.body()
+    } else {
+       config = Config(0f, null, URLS())
+    }
     return URL(config, response.bodyAsText())
+}
+
+
+// Set up a Client and then try to get the url_config.
+// TODO: Add Check for if the URL is not correct (endpoint cannot be reached).
+fun getConfig(url_config: String) : URL {
+    val client = HttpClient(OkHttp) {
+        install(ContentNegotiation) {
+            json(Json {
+                ignoreUnknownKeys = true
+                prettyPrint = true
+                isLenient = true
+            })
+        }
+    }
+
+    var urls: URL
+    runBlocking {
+        urls = getURLS(client, url_config)
+    }
+
+    return urls
+}
+
+
+// Wrapper for getConfig, returns true if the config retrieved with no error.
+fun checkConfig(url_config: String) : Boolean {
+    val urls = getConfig(url_config)
+    return urls.error != null
 }
 
 
@@ -152,10 +189,18 @@ actual object MainFactory {
     actual fun createMain(): Main = JvmMain
 }
 
+fun frm(value: Double, precision: Int) : String {
+    return "%.${precision}".format(value)
+}
 
+fun frm(value: Float, precision: Int) : String {
+    return "%.${precision}".format(value)
+}
+
+// Anything that goes in here is public API
 object JvmMain : Main {
 
-    //https://gaumala.com/posts/2020-01-27-working-with-streams-kotlin.html
+    // Credit to: https://gaumala.com/posts/2020-01-27-working-with-streams-kotlin.html
     class ObservableInputStream(private val chunk: ByteArray, private val onBytesRead: (Long) -> Unit) : InputStream() {
         private var bytesRead: Long = 0
 
@@ -289,31 +334,24 @@ object JvmMain : Main {
         return ((System.nanoTime() - startTime) / 1_000_000.0)
     }
 
+    // Find a way to make file system dynamic for all calls
     override fun main(args: Array<String>, outputChannel: Channel<String>): Unit {
+        //main(args, URL_CONFIG, outputChannel, File("./"), true)
+        main(args, URL_CONFIG, outputChannel, File(Paths.get("").toAbsolutePath().toString()), true)
 
-        // Initialize global send
+    }
+
+    fun main(args: Array<String>, url_config: String, outputChannel: Channel<String>, path: File, writeFiles: Boolean): Unit {
+        // Initialize global send (this is used as the ByteArray for the streaming Body for each individual upload connection)
         SEND = "x"
         for (i in 0..16) {
             SEND += SEND
         }
 
+        // Config retrieval
+        val urls = getConfig(url_config)
 
-        // Initial Config Retrieval
-        val client = HttpClient(OkHttp) {
-            install(ContentNegotiation) {
-                json(Json {
-                    ignoreUnknownKeys = true
-                    prettyPrint = true
-                    isLenient = true
-                })
-            }
-        }
-
-        var urls: URL
-        runBlocking{
-            urls = getURLS(client, URL_CONFIG)
-        }
-
+        // Make sure that we parsed with no errors
         if (urls.error != null) {
             println("Had a problem parsing config json urls: ${urls.error}")
             exitProcess(0)
@@ -325,19 +363,19 @@ object JvmMain : Main {
 
         // Latency Channels & Stability
         var uploadLatencyChannel= Channel<DataPoint>()
-        var uploadLatencyStability = LatencyStability("Upload", uploadLatencyChannel, 5, 10f)
+        var uploadLatencyStability = LatencyStability("Upload", uploadLatencyChannel, 5, 10f, path, writeFiles)
         var downloadLatencyChannel = Channel<DataPoint>()
-        var downloadLatencyStability = LatencyStability("Download", downloadLatencyChannel, 5, 10f)
+        var downloadLatencyStability = LatencyStability("Download", downloadLatencyChannel, 5, 10f, path, writeFiles)
 
         // Throughput Channels & Stability
         var uploadThroughputChannel = Channel<HookDataPoint>()
-        var uploadThroughputStability = ThroughputStability("Upload", uploadThroughputChannel, 5, 10f)
+        var uploadThroughputStability = ThroughputStability("Upload", uploadThroughputChannel, 5, 10f, path, writeFiles)
         var downloadThroughputChannel = Channel<HookDataPoint>()
-        var downloadThroughputStability = ThroughputStability("Download", downloadThroughputChannel, 5, 10f)
+        var downloadThroughputStability = ThroughputStability("Download", downloadThroughputChannel, 5, 10f, path, writeFiles)
 
         // Foreign Latency Channel & Stability
         var foreignLatencyChannel = Channel<DataPoint>()
-        var foreignLatencyStability = LatencyStability("Foreign", foreignLatencyChannel, 5, 10f)
+        var foreignLatencyStability = LatencyStability("Foreign", foreignLatencyChannel, 5, 10f, path, writeFiles)
 
 
         var numUploadConnections = 0
@@ -358,10 +396,17 @@ object JvmMain : Main {
                 numDownloadConnections += 1
                 val numDown = numDownloadConnections
                 launch(newSingleThreadContext("D:$numDown")) {
-                    val connection = org.responsiveness.main.DownloadConnection(urls.download, downloadLatencyChannel, downloadThroughputChannel, "D$numDown")
+                    val connection = org.responsiveness.main.DownloadConnection(
+                        urls.download,
+                        downloadLatencyChannel,
+                        downloadThroughputChannel,
+                        "D$numDown"
+                    )
                     connection.loadConnection()
                     delay(1000)
-                    connection.startProbes(urls.probe)
+                    if (NUM_CONNECTIONS_TO_PROBE == 0 || (numDown <= NUM_CONNECTIONS_TO_PROBE)) {
+                        connection.startProbes(urls.probe)
+                    }
                 }
             }
             // Upload Starts
@@ -369,10 +414,17 @@ object JvmMain : Main {
                 numUploadConnections += 1
                 val numUp = numUploadConnections
                 launch(newSingleThreadContext("U:$numUp")) {
-                    val connection = org.responsiveness.main.UploadConnection(urls.upload, uploadLatencyChannel, uploadThroughputChannel, "U$numUp")
+                    val connection = org.responsiveness.main.UploadConnection(
+                        urls.upload,
+                        uploadLatencyChannel,
+                        uploadThroughputChannel,
+                        "U$numUp"
+                    )
                     connection.loadConnection()
                     delay(1000)
-                    connection.startProbes(urls.probe)
+                    if (NUM_CONNECTIONS_TO_PROBE == 0 || (numUp <= NUM_CONNECTIONS_TO_PROBE)) {
+                        connection.startProbes(urls.probe)
+                    }
                 }
             }
 
@@ -387,17 +439,24 @@ object JvmMain : Main {
 
                 delay(1000)
                 // While we don't have stability across the board
-                while (!(uploadLatencyStable && downloadLatencyStable && uploadThroughputStable && downloadThroughputStable && foreignLatencyStable)) {
+                while ((System.nanoTime() - testStartTime < (TimeUnit.SECONDS.toNanos(20))) && !(uploadLatencyStable && downloadLatencyStable && uploadThroughputStable && downloadThroughputStable && foreignLatencyStable)) {
                     // Spawn new connections
                     // DownloadsConnections
                     for (i in 1..CONNECTION_INCREASE_COUNT) {
                         numDownloadConnections += 1
                         val numDown = numDownloadConnections
                         launch(newSingleThreadContext("D:$numDown")) {
-                            val connection = org.responsiveness.main.DownloadConnection(urls.download, downloadLatencyChannel, downloadThroughputChannel, "D$numDown")
+                            val connection = org.responsiveness.main.DownloadConnection(
+                                urls.download,
+                                downloadLatencyChannel,
+                                downloadThroughputChannel,
+                                "D$numDown"
+                            )
                             connection.loadConnection()
                             delay(1000)
-                            connection.startProbes(urls.probe)
+                            if (NUM_CONNECTIONS_TO_PROBE == 0 || (numDown <= NUM_CONNECTIONS_TO_PROBE)) {
+                                connection.startProbes(urls.probe)
+                            }
                         }
                     }
                     // UploadConnections
@@ -405,27 +464,38 @@ object JvmMain : Main {
                         numUploadConnections += 1
                         val numUp = numUploadConnections
                         launch(newSingleThreadContext("U:$numUp")) {
-                            val connection = org.responsiveness.main.UploadConnection(urls.upload, uploadLatencyChannel, uploadThroughputChannel, "U$numUp")
+                            val connection = org.responsiveness.main.UploadConnection(
+                                urls.upload,
+                                uploadLatencyChannel,
+                                uploadThroughputChannel,
+                                "U$numUp"
+                            )
                             connection.loadConnection()
                             delay(1000)
-                            connection.startProbes(urls.probe)
+                            if (NUM_CONNECTIONS_TO_PROBE == 0 || (numUp <= NUM_CONNECTIONS_TO_PROBE)) {
+                                connection.startProbes(urls.probe)
+                            }
                         }
                     }
 
                     // Spawn all foreign connections
                     // We don't want to add delay normal test loop
-                    launch {
+                    launch(newSingleThreadContext("ForeignConnections")) {
                         for (i in 1..FOREIGN_CONNECTION_COUNT) {
-                            for (x in 1..10) {
+                            for (x in 1..5) {
                                 numForeignConnections += 1
                                 val numForeign = numForeignConnections
                                 // TODO use single thread context?
                                 launch {
-                                    val connection = org.responsiveness.main.ForeignConnection(urls.probe, foreignLatencyChannel, "F$numForeign")
+                                    val connection = org.responsiveness.main.ForeignConnection(
+                                        urls.probe,
+                                        foreignLatencyChannel,
+                                        "F$numForeign"
+                                    )
                                     connection.loadConnection()
                                 }
                                 // Pause for the amount needed
-                                delay((1000 / 10 / FOREIGN_CONNECTION_COUNT).toLong())
+                                delay((1000 / 5 / FOREIGN_CONNECTION_COUNT).toLong())
                             }
                         }
                     }
@@ -438,21 +508,51 @@ object JvmMain : Main {
                     foreignLatencyStable = foreignLatencyStability.isStable()
                     uploadThroughputStable = uploadThroughputStability.isStable()
                     downloadThroughputStable = downloadThroughputStability.isStable()
-
-
-                    outputChannel.send("###${(ms(System.nanoTime() - testStartTime) / 1000)}s: UploadLatency:${if (uploadLatencyStable) "" else " not"} stable | DownloadLatency:${if (downloadLatencyStable) "" else " not"} stable | ForeignLatency:${if (foreignLatencyStable) "" else " not"} stable | UploadThroughput:${if (uploadThroughputStable) "" else " not"} stable | DownloadThroughput:${if (downloadThroughputStable) "" else " not"} stable")
-                    outputChannel.send("###Upload Latency: ${uploadLatencyStability.getLastMovingPoint()} ms | Download Latency: ${downloadLatencyStability.getLastMovingPoint()} ms | Foreign Latency: ${foreignLatencyStability.getLastMovingPoint()} ms")
-                    outputChannel.send("###Upload Throughput: ${uploadThroughputStability.getLastMovingPoint()} Mb/s | Download Throughput: ${downloadThroughputStability.getLastMovingPoint()} Mb/s")
+                    
+                    launch {
+                        // outputChannel.send("${(ms(System.nanoTime() - testStartTime) / 1000)}s: UploadLatency:${if (uploadLatencyStable) "" else " not"} stable | DownloadLatency:${if (downloadLatencyStable) "" else " not"} stable | ForeignLatency:${if (foreignLatencyStable) "" else " not"} stable | UploadThroughput:${if (uploadThroughputStable) "" else " not"} stable | DownloadThroughput:${if (downloadThroughputStable) "" else " not"} stable")
+                        outputChannel.send("Latency: Upload %.2f ms | Download %.2f ms | Foreign %.2f ms".format(uploadLatencyStability.getLastMovingPoint(), downloadLatencyStability.getLastMovingPoint(), foreignLatencyStability.getLastMovingPoint()))
+                        outputChannel.send("Throughput: Upload %.3f MB/s | Download %.3f MB/s".format(uploadThroughputStability.getLastMovingPoint(), downloadThroughputStability.getLastMovingPoint()))
+                        val uP90 = uploadLatencyStability.getP90()
+                        val dP90 = downloadLatencyStability.getP90()
+                        val fP90 = foreignLatencyStability.getP90()
+                        // Todo, Foreign Latency should separate its 2/3 measurements (tcp, tls, http)
+                        // outputChannel.send("Upload Latency P90: ${uP90} ms | Download Latency P90: ${dP90} ms | Foreign Latency P90 ${fP90} ms")
+                        // Todo, confirm RPM calculation
+                        val rpm =  60_000 / ((uP90 + dP90 + (2 * fP90)) / 4)
+                        outputChannel.send("\n\n %ds: RPM Score: %.3f".format(floor((ms(System.nanoTime() - testStartTime) / 1000).toDouble()).toInt(), rpm))
+                    }
 
                     println("###${(ms(System.nanoTime() - testStartTime) / 1000)}s: UploadLatency:${if (uploadLatencyStable) "" else " not"} stable | DownloadLatency:${if (downloadLatencyStable) "" else " not"} stable | ForeignLatency:${if (foreignLatencyStable) "" else " not"} stable | UploadThroughput:${if (uploadThroughputStable) "" else " not"} stable | DownloadThroughput:${if (downloadThroughputStable) "" else " not"} stable")
                     println("###Upload Latency: ${uploadLatencyStability.getLastMovingPoint()} ms | Download Latency: ${downloadLatencyStability.getLastMovingPoint()} ms | Foreign Latency: ${foreignLatencyStability.getLastMovingPoint()} ms")
-                    println("###Upload Throughput: ${uploadThroughputStability.getLastMovingPoint()} Mb/s | Download Throughput: ${downloadThroughputStability.getLastMovingPoint()} Mb/s")
+                    println("###Upload Throughput: ${uploadThroughputStability.getLastMovingPoint()} MB/s | Download Throughput: ${downloadThroughputStability.getLastMovingPoint()} MB/s")
+                    val uP90 = uploadLatencyStability.getP90()
+                    val dP90 = downloadLatencyStability.getP90()
+                    val fP90 = foreignLatencyStability.getP90()
+                    // Todo, Foreign Latency should separate its 2/3 measurements (tcp, tls, http)
+                    println("Upload Latency P90: ${uP90} ms | Download Latency P90: ${dP90} ms | Foreign Latency P90 ${fP90} ms")
+                    // Todo, confirm RPM calculation
+                    val rpm =  60_000 / ((uP90 + dP90 + (2 * fP90)) / 4)
+                    println("RPM Score: ${rpm}")
                 }
-                System.exit(0)
+                val uP90 = uploadLatencyStability.getP90()
+                val dP90 = downloadLatencyStability.getP90()
+                val fP90 = foreignLatencyStability.getP90()
+                // Todo, Foreign Latency should seperate its 2/3 measurements (tcp, tls, http)
+                if (!(uploadLatencyStable && downloadLatencyStable && uploadThroughputStable && downloadThroughputStable && foreignLatencyStable)) {
+                    println("Test did not reach stability")
+                    println("Final Stabilities: UploadLatency:${if (uploadLatencyStable) "" else " not"} stable | DownloadLatency:${if (downloadLatencyStable) "" else " not"} stable | ForeignLatency:${if (foreignLatencyStable) "" else " not"} stable | UploadThroughput:${if (uploadThroughputStable) "" else " not"} stable | DownloadThroughput:${if (downloadThroughputStable) "" else " not"} stable")
+                    println("Partial Results below")
+                } else {
+                    println("Test reached stability")
+                    println("Results below")
+                }
+                println("Latest Upload Throughput: ${uploadThroughputStability.getLastMovingPoint()} MB/s | Latest Download Throughput: ${downloadThroughputStability.getLastMovingPoint()} MB/s")
+                println("Upload Latency P90: ${uP90} ms | Download Latency P90: ${dP90} ms | Foreign Latency P90 ${fP90} ms")
+                // Todo, confirm RPM calculation
+                val rpm =  60_000 / ((uP90 + dP90 + (2 * fP90)) / 4)
+                println("RPM Score: ${rpm}")
             }
-            println("REACHED AFTER LAUNCHES ####################################")
         }
-        println("REACHED AFTER BLOCK ####################################")
-        System.exit(0)
     }
 }

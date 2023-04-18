@@ -18,6 +18,7 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
+import java.time.Duration
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -107,7 +108,13 @@ abstract class Connection(latencyChannel: Channel<DataPoint>, val connectionID: 
                     // Create a new connection pool to make sure we don't reuse the old ones
                     // Force max connections to be 1
                     // TODO Test that it is only 1 connection; Seems so
-                    connectionPool(ConnectionPool(2, 10, TimeUnit.SECONDS))
+                    val connectionPool_ = ConnectionPool(2, 60, TimeUnit.SECONDS)
+                    connectionPool_.evictAll() // Force Evict any current
+                    connectionPool(connectionPool_)
+
+                    connectTimeout(Duration.ZERO) // No Timeout
+                    readTimeout(Duration.ZERO) // No Timeout
+                    writeTimeout(Duration.ZERO) // No Timeout
 
                     // Add listener to measure RTT
                     eventListenerFactory(listenerFactory)
@@ -239,7 +246,7 @@ class DownloadConnection(private val url: String, latencyChannel: Channel<DataPo
                     var elapsedTimeReading = 0L
                     while (!channel.isClosedForRead) {
                         val packet =
-                            channel.readRemaining(DEFAULT_BUFFER_SIZE.toLong()) //  // DEFAULT_BUFFER_SIZE = 8192 as tested
+                            channel.readRemaining(DEFAULT_BUFFER_SIZE.toLong() * 2L) //  // DEFAULT_BUFFER_SIZE = 8192 as tested
                         while (!packet.isEmpty) {
                             val bytes: ByteArray
                             val timeInNanos = measureNanoTime {
@@ -250,7 +257,7 @@ class DownloadConnection(private val url: String, latencyChannel: Channel<DataPo
                             //println("Read ${bytes.size} bytes from ${httpResponse.contentLength()} in ${timeInNanos} ns")
                         }
                     }
-                    println("Success!")
+                    println("Reached After Download Call")
                 }
             }
         }
@@ -357,7 +364,7 @@ class ForeignConnection(private val url: String, latencyChannel: Channel<DataPoi
 
         // TODO Confirm Async?
         with(CoroutineScope(coroutineContext)) {
-            launch(newSingleThreadContext("loadConnection:${connectionID}")) {
+            runBlocking() {
                 client.get(url) {
                     header("ID", connectionID)
                 }
@@ -423,6 +430,7 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
     var probeListeners = HashMap<String, Listener>()
     var loadConnection: okhttp3.Connection? = null
 
+
     // Says it is an error to mutate Call here. DO NOT MUTATE Call.
     override fun create(call: Call): EventListener {
         var callID = call.request().headers.get("ID")
@@ -463,6 +471,7 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
         val gotConnectionCallback: (okhttp3.Connection) -> Boolean) : EventListener() {
         val connectionStats = ConnectionStats(startTime)
         lateinit var connection: okhttp3.Connection
+        var writeResults = true // Used to stop probes sent on wrong connections from writing
 
         // https://square.github.io/okhttp/3.x/okhttp/okhttp3/EventListener.html#EventListener--
 
@@ -479,7 +488,7 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
 
         override fun callFailed(call: Call, ioe: IOException) {
             connectionStats.callEnd = System.nanoTime()
-            println("${this.callID}:${this.connectionID}: Call Failed")
+            println("${this.callID}:${this.connectionID}: Call Failed | ${ioe}")
         }
 
         // DNS events
@@ -491,7 +500,7 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
         override fun dnsEnd(call: Call, domainName: String, inetAddressList: List<InetAddress>) {
             connectionStats.dnsEnd = System.nanoTime()
             // println("${this.ID}: DNS Search Returned: ${JvmMain.currTimeDelta(startTime)} ms | for ${domainName} | ${inetAddressList}")
-            println("${this.callID}:${this.connectionID}: DNS search took: ${ms(connectionStats.dnsEnd - connectionStats.dnsStart)} ms")
+            // println("${this.callID}:${this.connectionID}: DNS search took: ${ms(connectionStats.dnsEnd - connectionStats.dnsStart)} ms")
         }
 
         // TLS events
@@ -504,7 +513,7 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
             connectionStats.tlsEnd = System.nanoTime()
             if (handshake != null) {
                 // println("${this.ID}: TLS connection finished: ${JvmMain.currTimeDelta(startTime)} ms | version: ${handshake.tlsVersion}")
-                println("${this.callID}:${this.connectionID}: TLS connection took: ${ms(connectionStats.tlsEnd - connectionStats.tlsStart)} ms | version: ${handshake.tlsVersion}")
+                // println("${this.callID}:${this.connectionID}: TLS connection took: ${ms(connectionStats.tlsEnd - connectionStats.tlsStart)} ms | version: ${handshake.tlsVersion}")
                 if (this.callID.startsWith("F")) {
                     val myself = this
                     GlobalScope.launch {
@@ -554,16 +563,18 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
 
             // println("${this.callID}:${this.connectionID}: HTTP (request header start - response header start) took: ${ms(connectionStats.responseHeaderStart - connectionStats.requestHeaderStart)} ms")
             if (this.callID.startsWith("P") || this.callID.startsWith("F")) {
-                val myself = this
-                GlobalScope.launch {
-                    latencyChannel.send(
-                        ProbeDataPoint(
-                            ms(connectionStats.responseHeaderStart - connectionStats.requestHeaderStart),
-                            myself.connectionID,
-                            myself.callID,
-                            "HTTP"
+                if (writeResults) {
+                    val myself = this
+                    GlobalScope.launch {
+                        latencyChannel.send(
+                            ProbeDataPoint(
+                                ms(connectionStats.responseHeaderStart - connectionStats.requestHeaderStart),
+                                myself.connectionID,
+                                myself.callID,
+                                "HTTP"
+                            )
                         )
-                    )
+                    }
                 }
             }
     }
@@ -590,17 +601,17 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
 
             // println("${this.callID}:${this.connectionID}: connectEnd SOCKET STARTED: ${JvmMain.currTimeDelta(startTime)} ms | protocol: ${protocol}")
             if (this.callID.startsWith("F")) {
-                val myself = this
-                GlobalScope.launch {
-                    latencyChannel.send(
-                        ProbeDataPoint(
-                            ms(connectionStats.socketEnd - connectionStats.socketStart),
-                            myself.connectionID,
-                            myself.callID,
-                            "Socket"
-                        )
-                    )
-                }
+//                val myself = this
+//                GlobalScope.launch {
+//                    latencyChannel.send(
+//                        ProbeDataPoint(
+//                            ms(connectionStats.socketEnd - connectionStats.socketStart),
+//                            myself.connectionID,
+//                            myself.callID,
+//                            "Socket"
+//                        )
+//                    )
+//                }
             }
         }
 
@@ -615,6 +626,7 @@ class ListenerFactory(val channel: Channel<DataPoint>, val connectionID: String)
             if (gotConnectionCallback(connection)) {
                 // Do nothing
             } else {
+                writeResults = false
                 println("${this.callID} : ${this.connectionID}: connection acquired is not the same as load connection")
             }
 
